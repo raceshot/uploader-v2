@@ -3,6 +3,8 @@ import { ref, onMounted, onUnmounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
+import { check } from '@tauri-apps/plugin-updater'
+import { relaunch } from '@tauri-apps/plugin-process'
 import MapModal from './components/MapModal.vue'
 import GpxPreviewModal from './components/GpxPreviewModal.vue'
 
@@ -60,9 +62,28 @@ const logPanel = ref<HTMLElement | null>(null)
 
 let unlisteners: UnlistenFn[] = []
 
+async function checkForUpdates() {
+  try {
+    const update = await check()
+    if (update?.available) {
+      const yes = window.confirm(
+        `有新版本 ${update.version} 可以更新！\n\n${update.body ?? ''}\n\n是否立即下載並安裝？`
+      )
+      if (yes) {
+        await update.downloadAndInstall()
+        await relaunch()
+      }
+    }
+  } catch {
+    // 靜默失敗，不影響正常使用
+  }
+}
+
 onMounted(async () => {
   const cfg = await invoke<AppConfig>('cmd_get_config')
   applyConfig(cfg)
+
+  checkForUpdates()
 
   unlisteners.push(
     await listen<string>('auth://token', ({ payload }) => {
