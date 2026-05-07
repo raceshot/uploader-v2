@@ -139,12 +139,16 @@ pub struct FileInfo {
 
 impl FileInfo {
     pub fn from_path(path: &Path) -> std::io::Result<Self> {
-        use std::os::unix::fs::MetadataExt;
         let meta = std::fs::metadata(path)?;
+        let mtime_ns = meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
         Ok(Self {
             abs_path: path.to_string_lossy().into_owned(),
             file_size: meta.len() as i64,
-            mtime_ns: meta.mtime_nsec(),
+            mtime_ns,
         })
     }
 }
