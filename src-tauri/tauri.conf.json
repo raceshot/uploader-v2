@@ -1,0 +1,59 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "運動拍檔上傳工具",
+  "version": "1.2.0",
+  "identifier": "app.raceshot.uploader",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "運動拍檔 Raceshot 上傳工具",
+        "width": 960,
+        "height": 780,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.13",
+      "entitlements": null,
+      "dmg": {
+        "background": null,
+        "windowSize": { "width": 660, "height": 400 }
+      }
+    },
+    "windows": {
+      "wix": {
+        "language": "zh-TW"
+      }
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libwebkit2gtk-4.1-0", "libssl-dev"]
+      },
+      "rpm": {
+        "depends": ["webkit2gtk4.1", "openssl"]
+      }
+    }
+  }
+}

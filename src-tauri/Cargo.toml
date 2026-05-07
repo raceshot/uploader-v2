@@ -1,0 +1,38 @@
+[package]
+name = "raceshot-uploader"
+version = "1.2.0"
+description = "運動拍檔 Raceshot 圖片上傳工具"
+authors = ["運動拍檔"]
+edition = "2021"
+
+[lib]
+name = "raceshot_uploader_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri            = { version = "2", features = [] }
+tauri-plugin-dialog  = "2"
+tauri-plugin-shell   = "2"
+tauri-plugin-opener  = "2"
+
+serde       = { version = "1", features = ["derive"] }
+serde_json  = "1"
+anyhow      = "1"
+thiserror   = "1"
+
+tokio       = { version = "1", features = ["full"] }
+reqwest     = { version = "0.12", features = ["multipart", "json"] }
+
+rusqlite    = { version = "0.31", features = ["bundled"] }
+sha2        = "0.10"
+hex         = "0.4"
+
+walkdir      = "2"
+quick-xml    = "0.36"
+chrono       = { version = "0.4", features = ["serde"] }
+exif         = { package = "kamadak-exif", version = "0.5" }
+dirs-next    = "2"
+urlencoding  = "2"
