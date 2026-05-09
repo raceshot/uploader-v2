@@ -40,8 +40,8 @@ const gpxTimeOffset = ref(0)
 const gpxFallbackMode = ref('manual')
 const gpxMaxGap = ref(300)
 const gpxPreviewCount = ref(50)
-const concurrency = ref(20)
-const autoMode = ref(false) // false = 手動，true = 自動調整
+const concurrency = ref(4)  // 自動模式起始值；手動模式使用者自設
+const autoMode = ref(true)  // true = 自動調整（預設），false = 手動
 // 自動調整用的滑動窗口
 const autoWindow = ref<boolean[]>([])
 const AUTO_WINDOW_SIZE = 20
@@ -162,11 +162,11 @@ async function doLogin() {
 
 async function doVerifyToken(t: string) {
   try {
-    const user = await invoke<{ role?: string; name?: string }>('cmd_verify_token', { token: t })
+    const user = await invoke<{ role?: string; name?: string; email?: string }>('cmd_verify_token', { token: t })
     token.value = t
     loginStatus.value = 'ok'
     userRole.value = user.role ?? 'user'
-    userName.value = user.name ?? ''
+    userName.value = user.email ?? user.name ?? ''
     loginLabel.value = userName.value ? `已登入：${userName.value}` : `已登入`
     await loadEvents()
     await saveConfig()
@@ -694,10 +694,9 @@ select.input {
 .status {
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.04em;
   padding: 3px 10px;
   border-radius: 2px;
-  text-transform: uppercase;
 }
 .status--none    { color: var(--n40); background: var(--n05); }
 .status--pending { color: var(--gold); background: #fdf6e3; }
