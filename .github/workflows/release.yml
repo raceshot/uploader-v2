@@ -58,6 +58,6 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: '運動拍檔 Raceshot 上傳工具 ${{ github.ref_name }}'
           releaseBody: '請查看 CHANGELOG 瞭解本版更新內容。'
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
