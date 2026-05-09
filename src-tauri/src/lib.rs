@@ -7,7 +7,7 @@ mod scanner;
 mod uploader;
 
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
@@ -23,6 +23,7 @@ use uploader::{upload_single, verify_token, list_events, choose_endpoint, Upload
 pub struct AppState {
     pub db: Arc<Mutex<rusqlite::Connection>>,
     pub upload_running: Arc<AtomicBool>,
+    pub upload_concurrency: Arc<AtomicUsize>,
     pub http_client: reqwest::Client,
 }
 
@@ -207,9 +208,12 @@ async fn cmd_start_upload(
     let running = Arc::clone(&state.upload_running);
     let db_arc = Arc::clone(&state.db);
     let client = state.http_client.clone();
+    let live_concurrency = Arc::clone(&state.upload_concurrency);
+    // 以前端傳入的並行數作為初始值
+    live_concurrency.store(params.concurrency as usize, Ordering::Relaxed);
 
     tokio::spawn(async move {
-        let result = run_upload(&app, &client, &db_arc, &running, &params).await;
+        let result = run_upload(&app, &client, &db_arc, &running, &live_concurrency, &params).await;
         running.store(false, Ordering::SeqCst);
         if let Err(e) = result {
             let _ = app.emit("upload://log", LogEvent {
@@ -227,6 +231,7 @@ async fn run_upload(
     client: &reqwest::Client,
     db_arc: &Arc<Mutex<rusqlite::Connection>>,
     running: &Arc<AtomicBool>,
+    live_concurrency: &Arc<AtomicUsize>,
     params: &UploadParams,
 ) -> error::Result<()> {
     let folder = std::path::Path::new(&params.folder);
@@ -261,8 +266,11 @@ async fn run_upload(
 
     let endpoint = choose_endpoint(&params.event_id);
     let total = all_files.len();
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(params.concurrency as usize));
-    let mut handles: Vec<tokio::task::JoinHandle<bool>> = Vec::new();
+    let active = Arc::new(AtomicUsize::new(0));
+    // channel: bool = success
+    let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
+    let mut success = 0usize;
+    let mut failed = 0usize;
     let mut current = 0usize;
 
     for f in all_files {
@@ -272,6 +280,12 @@ async fn run_upload(
                 level: "warn".to_string(),
             });
             break;
+        }
+
+        // 排空已完成的結果
+        while let Ok(s) = done_rx.try_recv() {
+            active.fetch_sub(1, Ordering::Relaxed);
+            if s { success += 1; } else { failed += 1; }
         }
 
         let hash = compute_sha256_head(std::path::Path::new(&f.abs_path)).unwrap_or_default();
@@ -293,8 +307,19 @@ async fn run_upload(
                 message: format!("⏭ 跳過（已上傳）：{}", f.file_name),
                 level: "info".to_string(),
             });
-            handles.push(tokio::spawn(async move { true }));
+            success += 1;
             continue;
+        }
+
+        // 等待有空位（支援上傳中動態調整並行數）
+        while active.load(Ordering::Relaxed) >= live_concurrency.load(Ordering::Relaxed) {
+            match done_rx.recv().await {
+                Some(s) => {
+                    active.fetch_sub(1, Ordering::Relaxed);
+                    if s { success += 1; } else { failed += 1; }
+                }
+                None => break,
+            }
         }
 
         let (lon, lat) = if let Some(ref ctx) = gpx_ctx {
@@ -304,7 +329,7 @@ async fn run_upload(
             (params.longitude, params.latitude)
         };
 
-        let permit = Arc::clone(&semaphore).acquire_owned().await.unwrap();
+        active.fetch_add(1, Ordering::Relaxed);
         let client_clone = client.clone();
         let token = params.token.clone();
         let event_id = params.event_id.clone();
@@ -318,9 +343,9 @@ async fn run_upload(
         let file_size = f.file_size;
         let mtime_ns = f.mtime_ns;
         let app_clone = app.clone();
+        let done_tx_clone = done_tx.clone();
 
-        let handle = tokio::spawn(async move {
-            let _permit = permit;
+        tokio::spawn(async move {
             let path = std::path::Path::new(&abs_path);
 
             let result = upload_single(
@@ -345,18 +370,19 @@ async fn run_upload(
                 });
             }
 
-            result.success
+            let _ = done_tx_clone.send(result.success);
         });
-
-        handles.push(handle);
     }
 
-    let mut success = 0usize;
-    let mut failed = 0usize;
-    for handle in handles {
-        match handle.await {
-            Ok(true) => success += 1,
-            _ => failed += 1,
+    // 等待所有進行中的任務完成
+    drop(done_tx);
+    while active.load(Ordering::Relaxed) > 0 {
+        match done_rx.recv().await {
+            Some(s) => {
+                active.fetch_sub(1, Ordering::Relaxed);
+                if s { success += 1; } else { failed += 1; }
+            }
+            None => break,
         }
     }
 
@@ -372,6 +398,13 @@ async fn run_upload(
 #[tauri::command]
 async fn cmd_stop_upload(state: State<'_, AppState>) -> Result<(), AppError> {
     state.upload_running.store(false, Ordering::SeqCst);
+    Ok(())
+}
+
+#[tauri::command]
+async fn cmd_set_concurrency(state: State<'_, AppState>, n: usize) -> Result<(), AppError> {
+    let n = n.max(1);
+    state.upload_concurrency.store(n, Ordering::Relaxed);
     Ok(())
 }
 
@@ -399,6 +432,7 @@ pub fn run() {
         .manage(AppState {
             db: Arc::new(Mutex::new(db)),
             upload_running: Arc::new(AtomicBool::new(false)),
+            upload_concurrency: Arc::new(AtomicUsize::new(20)),
             http_client: reqwest::Client::new(),
         })
         .invoke_handler(tauri::generate_handler![
@@ -411,6 +445,7 @@ pub fn run() {
             cmd_preview_gpx,
             cmd_start_upload,
             cmd_stop_upload,
+            cmd_set_concurrency,
             cmd_clear_history,
         ])
         .run(tauri::generate_context!())

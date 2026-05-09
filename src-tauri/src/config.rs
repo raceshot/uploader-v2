@@ -32,7 +32,7 @@ impl Default for AppConfig {
             gpx_fallback_mode: "manual".to_string(),
             gpx_max_gap: 300,
             gpx_preview_count: 50,
-            concurrency: 4,
+            concurrency: 20,
             timeout: 120,
         }
     }

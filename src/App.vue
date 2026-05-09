@@ -28,6 +28,7 @@ export interface GpxPreviewRow {
 const loginStatus = ref<'none' | 'pending' | 'ok' | 'fail'>('none')
 const loginLabel = ref('未登入')
 const userRole = ref('')
+const userName = ref('')
 
 const folder = ref('')
 const selectedEventId = ref('')
@@ -39,7 +40,11 @@ const gpxTimeOffset = ref(0)
 const gpxFallbackMode = ref('manual')
 const gpxMaxGap = ref(300)
 const gpxPreviewCount = ref(50)
-const concurrency = ref(4)
+const concurrency = ref(20)
+const autoMode = ref(false) // false = 手動，true = 自動調整
+// 自動調整用的滑動窗口
+const autoWindow = ref<boolean[]>([])
+const AUTO_WINDOW_SIZE = 20
 const timeout = ref(120)
 
 const token = ref('')
@@ -91,6 +96,8 @@ onMounted(async () => {
     }),
     await listen<{ message: string; level: string }>('upload://log', ({ payload }) => {
       logs.value.push({ ...payload, ts: Date.now() })
+      if (payload.level === 'success') recordAutoResult(true)
+      else if (payload.level === 'error') recordAutoResult(false)
       setTimeout(() => {
         if (logPanel.value) logPanel.value.scrollTop = logPanel.value.scrollHeight
       }, 0)
@@ -155,17 +162,19 @@ async function doLogin() {
 
 async function doVerifyToken(t: string) {
   try {
-    const user = await invoke<{ role?: string }>('cmd_verify_token', { token: t })
+    const user = await invoke<{ role?: string; name?: string }>('cmd_verify_token', { token: t })
     token.value = t
     loginStatus.value = 'ok'
     userRole.value = user.role ?? 'user'
-    loginLabel.value = `已登入 (${userRole.value})`
+    userName.value = user.name ?? ''
+    loginLabel.value = userName.value ? `已登入：${userName.value}` : `已登入`
     await loadEvents()
     await saveConfig()
   } catch {
     loginStatus.value = 'fail'
     loginLabel.value = '登入失敗或 Token 過期'
     token.value = ''
+    userName.value = ''
   }
 }
 
@@ -229,6 +238,49 @@ async function previewGpx() {
   }
 }
 
+// ── 並行數自動調整 ────────────────────────────────────────────────────────────
+
+// 手動修改並行數 → 切換為手動模式
+function onConcurrencyInput() {
+  autoMode.value = false
+  invoke('cmd_set_concurrency', { n: concurrency.value }).catch(() => {})
+}
+
+function toggleAutoMode() {
+  autoMode.value = !autoMode.value
+  autoWindow.value = []
+  if (autoMode.value) {
+    // 切換自動時，從當前值的一半開始（但不低於 4）
+    concurrency.value = Math.max(4, Math.floor(concurrency.value / 2))
+    invoke('cmd_set_concurrency', { n: concurrency.value }).catch(() => {})
+  }
+}
+
+// 每次上傳結果（success/error）都會呼叫此函式
+function recordAutoResult(success: boolean) {
+  if (!autoMode.value || !isUploading.value) return
+  autoWindow.value.push(success)
+  if (autoWindow.value.length > AUTO_WINDOW_SIZE)
+    autoWindow.value.shift()
+  if (autoWindow.value.length < AUTO_WINDOW_SIZE) return
+
+  const successRate = autoWindow.value.filter(v => v).length / AUTO_WINDOW_SIZE
+  let newVal = concurrency.value
+  if (successRate >= 0.95) {
+    // 成功率高 → 增加 2
+    newVal = concurrency.value + 2
+  } else if (successRate < 0.8) {
+    // 失敗率過高 → 減少 30%
+    newVal = Math.max(1, Math.floor(concurrency.value * 0.7))
+  }
+  if (newVal !== concurrency.value) {
+    concurrency.value = newVal
+    invoke('cmd_set_concurrency', { n: newVal }).catch(() => {})
+    addLog(`自動調整並行數 → ${newVal}（成功率 ${Math.round(successRate * 100)}%）`, 'info')
+    autoWindow.value = [] // 重置窗口
+  }
+}
+
 // ── 上傳 ───────────────────────────────────────────────────────────────────
 
 function addLog(message: string, level = 'info') {
@@ -249,6 +301,7 @@ async function startUpload() {
   isUploading.value = true
   progress.value = 0
   progressLabel.value = '準備上傳...'
+  autoWindow.value = [] // 重置自動調整窗口
   const eid = selectedEventId.value || savedEventId.value
 
   await invoke('cmd_start_upload', {
@@ -372,8 +425,17 @@ function eventLabel(ev: EventInfo) { return `${ev.id} (${ev.name} - ${ev.date})`
         <details class="advanced">
           <summary class="field-label">ADVANCED · 進階設定</summary>
           <div class="row wrap gap8 mt8">
-            <span class="sublabel">並發數</span>
-            <input class="input w80" type="number" v-model.number="concurrency" min="1" max="20" :disabled="isUploading" />
+            <span class="sublabel">並行數</span>
+            <input class="input w80" type="number" v-model.number="concurrency" min="1"
+              :disabled="isUploading && autoMode"
+              @input="onConcurrencyInput" />
+            <button
+              :class="['btn', 'btn--sm', autoMode ? 'btn--gold' : 'btn--outline']"
+              @click="toggleAutoMode"
+              :disabled="isUploading"
+              :title="autoMode ? '自動模式：依網路成功率調整' : '手動模式：固定並行數'">
+              {{ autoMode ? '⚡ 自動' : '手動' }}
+            </button>
             <span class="sublabel">逾時(秒)</span>
             <input class="input w80" type="number" v-model.number="timeout" min="10" max="300" :disabled="isUploading" />
           </div>
