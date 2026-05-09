@@ -49,6 +49,20 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install
 
+      # 從 tag (e.g. v1.2.5) 自動更新 tauri.conf.json 版本號
+      - name: Sync version from tag
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          node -e "
+            const fs = require('fs');
+            const p = 'src-tauri/tauri.conf.json';
+            const c = JSON.parse(fs.readFileSync(p));
+            c.version = '$TAG';
+            fs.writeFileSync(p, JSON.stringify(c, null, 2));
+            console.log('version set to', '$TAG');
+          "
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -60,4 +74,6 @@ jobs:
           releaseBody: '請查看 CHANGELOG 瞭解本版更新內容。'
           releaseDraft: false
           prerelease: false
+          updaterJsonPreferNsis: true
+          updaterJsonKeepUniversal: true
           args: ${{ matrix.args }}
