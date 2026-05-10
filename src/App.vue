@@ -19,8 +19,10 @@ interface AppConfig {
 interface EventInfo { id: string; name: string; date: string }
 interface LogEntry { message: string; level: string; ts: number }
 export interface GpxPreviewRow {
-  file_name: string; capture_time_utc: string | null
-  source: string; coord: string | null; note: string
+  file_name: string; abs_path: string; capture_time_utc: string | null
+  source: string; coord: string | null
+  lat: number | null; lon: number | null
+  note: string
 }
 
 // ── 狀態 ───────────────────────────────────────────────────────────────────
@@ -39,7 +41,7 @@ const gpxFile = ref('')
 const gpxTimeOffset = ref(0)
 const gpxFallbackMode = ref('manual')
 const gpxMaxGap = ref(300)
-const gpxPreviewCount = ref(50)
+const gpxPreviewCount = ref(10)
 const concurrency = ref(4)  // 自動模式起始值；手動模式使用者自設
 const autoMode = ref(true)  // true = 自動調整（預設），false = 手動
 // 自動調整用的滑動窗口

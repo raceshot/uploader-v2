@@ -24,9 +24,12 @@ pub struct PhotoCoord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpxPreviewRow {
     pub file_name: String,
+    pub abs_path: String,
     pub capture_time_utc: Option<String>,
     pub source: String,
     pub coord: Option<String>,
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
     pub note: String,
 }
 

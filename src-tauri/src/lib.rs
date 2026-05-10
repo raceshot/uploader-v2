@@ -159,8 +159,19 @@ async fn cmd_preview_gpx(params: GpxPreviewParams) -> Result<Vec<gpx::GpxPreview
 
     let folder = std::path::Path::new(&params.folder);
     let all_files = scan_folder(folder);
-    let sample_count = params.sample_count.min(all_files.len());
-    let samples = &all_files[..sample_count];
+    let total = all_files.len();
+    let sample_count = params.sample_count.min(total);
+
+    // 平均分布採樣，避免只取前 N 張
+    let samples: Vec<_> = if total == 0 {
+        vec![]
+    } else if total <= sample_count {
+        all_files.iter().collect()
+    } else {
+        (0..sample_count)
+            .map(|i| &all_files[i * (total - 1) / (sample_count - 1).max(1)])
+            .collect()
+    };
 
     let rows = samples
         .iter()
@@ -184,8 +195,11 @@ async fn cmd_preview_gpx(params: GpxPreviewParams) -> Result<Vec<gpx::GpxPreview
 
             gpx::GpxPreviewRow {
                 file_name: f.file_name.clone(),
+                abs_path: f.abs_path.clone(),
                 capture_time_utc,
                 source: coord.source,
+                lat: coord.lat,
+                lon: coord.lon,
                 coord: coord_str,
                 note: coord.note,
             }
