@@ -6,13 +6,36 @@ on:
       - 'v*'
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - shell: bash
+        run: |
+          set -euo pipefail
+          release_json="$RUNNER_TEMP/release.json"
+          if gh release view "$GITHUB_REF_NAME" --json isDraft --repo "$GITHUB_REPOSITORY" > "$release_json"; then
+            ruby -rjson -e 'release = JSON.parse(File.read(ARGV[0])); abort "Existing release is published" unless release["isDraft"] == true' "$release_json"
+          else
+            gh release create "$GITHUB_REF_NAME" --draft --title "運動拍檔 Raceshot 上傳工具 $GITHUB_REF_NAME" --notes "請查看 CHANGELOG 瞭解本版更新內容。" --repo "$GITHUB_REPOSITORY"
+          fi
+
   build:
+    needs: prepare
+    timeout-minutes: 350
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - platform: macos-latest
@@ -76,6 +99,7 @@ jobs:
           echo "APPLE_API_KEY_PATH=$key_path" >> "$GITHUB_ENV"
 
       - name: Build Tauri app
+        timeout-minutes: 330
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -89,8 +113,129 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: '運動拍檔 Raceshot 上傳工具 ${{ github.ref_name }}'
           releaseBody: '請查看 CHANGELOG 瞭解本版更新內容。'
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           updaterJsonPreferNsis: true
           retryAttempts: ${{ matrix.platform == 'macos-latest' && 2 || 0 }}
           args: ${{ matrix.args }} --config '{"bundle":{"createUpdaterArtifacts":true}}'
+
+      - name: Notarize and verify release DMG
+        if: matrix.platform == 'macos-latest'
+        timeout-minutes: 300
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          set -euo pipefail
+
+          dmg_dir="src-tauri/target/universal-apple-darwin/release/bundle/dmg"
+          shopt -s nullglob
+          dmg_paths=("$dmg_dir"/*.dmg)
+          if [[ "${#dmg_paths[@]}" -ne 1 ]]; then
+            echo "Expected exactly one DMG in $dmg_dir, found ${#dmg_paths[@]}" >&2
+            exit 1
+          fi
+          dmg_path="${dmg_paths[0]}"
+          notary_args=(--key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+          submission_json="$RUNNER_TEMP/dmg-notary-submit.json"
+          if ! xcrun notarytool submit "$dmg_path" "${notary_args[@]}" --output-format json > "$submission_json"; then
+            echo "Notary upload failed" >&2
+            exit 1
+          fi
+          submission_id="$(ruby -rjson -e 'submission = JSON.parse(File.read(ARGV[0])); id = submission["id"]; abort "Missing submission ID" unless id.is_a?(String) && !id.empty?; puts id' "$submission_json")"
+          echo "Notary submission ID: $submission_id"
+
+          poll_json="$RUNNER_TEMP/dmg-notary-info.json"
+          for poll in $(seq 1 280); do
+            if xcrun notarytool info "$submission_id" "${notary_args[@]}" --output-format json > "$poll_json"; then
+              if status="$(ruby -rjson -e 'info = JSON.parse(File.read(ARGV[0])); status = info["status"]; abort "Missing notarization status" unless status.is_a?(String); puts status' "$poll_json")"; then
+                echo "Notary poll $poll status: $status"
+                if [[ "$status" == "Accepted" ]]; then
+                  break
+                fi
+                if [[ "$status" != "In Progress" ]]; then
+                  xcrun notarytool log "$submission_id" "${notary_args[@]}" || echo "Unable to retrieve notarization log" >&2
+                  exit 1
+                fi
+              else
+                echo "Notary poll $poll returned unreadable JSON; retrying" >&2
+              fi
+            else
+              echo "Notary poll $poll failed; retrying" >&2
+            fi
+
+            if [[ "$poll" -eq 280 ]]; then
+              xcrun notarytool log "$submission_id" "${notary_args[@]}" || echo "Unable to retrieve notarization log" >&2
+              echo "Timed out waiting for notarization" >&2
+              exit 1
+            fi
+            sleep 60
+          done
+
+          xcrun stapler staple "$dmg_path"
+          xcrun stapler validate "$dmg_path"
+          codesign --verify --deep --strict --verbose=2 "$dmg_path"
+          spctl -a -vv -t open --context context:primary-signature "$dmg_path"
+
+          release_json="$RUNNER_TEMP/release-assets.json"
+          asset_name_file="$RUNNER_TEMP/dmg-asset-name"
+          asset_label_file="$RUNNER_TEMP/dmg-asset-label"
+          gh release view "$GITHUB_REF_NAME" --json isDraft,assets --repo "$GITHUB_REPOSITORY" > "$release_json"
+          ruby -rjson -e 'release = JSON.parse(File.read(ARGV[0])); abort "Release is not draft" unless release["isDraft"] == true; dmgs = release.fetch("assets").select { |asset| asset.fetch("name").end_with?(".dmg") }; abort "Expected exactly one release DMG asset, found #{dmgs.length}" unless dmgs.length == 1; asset = dmgs.first; File.binwrite(ARGV[1], asset.fetch("name")); File.binwrite(ARGV[2], asset["label"].to_s)' "$release_json" "$asset_name_file" "$asset_label_file"
+          asset_name="$(<"$asset_name_file")"
+          asset_label="$(<"$asset_label_file")"
+          case "$asset_name" in
+            ''|*/*)
+              echo "Invalid release DMG asset name: $asset_name" >&2
+              exit 1
+              ;;
+          esac
+          upload_path="$RUNNER_TEMP/$asset_name"
+          cp "$dmg_path" "$upload_path"
+          gh release upload "$GITHUB_REF_NAME" "$upload_path#$asset_label" --clobber --repo "$GITHUB_REPOSITORY"
+
+          download_dir="$(mktemp -d "$RUNNER_TEMP/dmg-recheck.XXXXXX")"
+          gh release download "$GITHUB_REF_NAME" --pattern "$asset_name" --dir "$download_dir" --repo "$GITHUB_REPOSITORY"
+          downloaded_dmg="$download_dir/$asset_name"
+          test -f "$downloaded_dmg"
+          source_sha="$(shasum -a 256 "$dmg_path" | awk '{print $1}')"
+          downloaded_sha="$(shasum -a 256 "$downloaded_dmg" | awk '{print $1}')"
+          if [[ "$source_sha" != "$downloaded_sha" ]]; then
+            echo "Re-downloaded DMG SHA-256 does not match validated source" >&2
+            exit 1
+          fi
+          xcrun stapler validate "$downloaded_dmg"
+          codesign --verify --deep --strict --verbose=2 "$downloaded_dmg"
+          spctl -a -vv -t open --context context:primary-signature "$downloaded_dmg"
+
+          mount_point="$(mktemp -d "$RUNNER_TEMP/dmg-mount.XXXXXX")"
+          mounted=0
+          trap 'if [[ "${mounted:-0}" -eq 1 ]]; then hdiutil detach "$mount_point" || true; fi' EXIT
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount_point" "$downloaded_dmg"
+          mounted=1
+          app_paths=()
+          while IFS= read -r -d '' app_path; do
+            app_paths+=("$app_path")
+          done < <(find "$mount_point" -type d -name '*.app' -prune -print0)
+          if [[ "${#app_paths[@]}" -ne 1 ]]; then
+            echo "Expected exactly one app in mounted DMG, found ${#app_paths[@]}" >&2
+            exit 1
+          fi
+          app_path="${app_paths[0]}"
+          xcrun stapler validate "$app_path"
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          spctl -a -vv -t exec "$app_path"
+          hdiutil detach "$mount_point"
+          mounted=0
+          trap - EXIT
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest --repo "$GITHUB_REPOSITORY"
