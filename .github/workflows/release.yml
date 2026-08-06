@@ -93,4 +93,5 @@ jobs:
           prerelease: false
           updaterJsonPreferNsis: true
           updaterJsonKeepUniversal: true
+          retryAttempts: ${{ matrix.platform == 'macos-latest' && 2 || 0 }}
           args: ${{ matrix.args }}
