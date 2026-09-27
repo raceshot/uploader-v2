@@ -14,7 +14,7 @@ interface AppConfig {
   token: string; folder: string; event_id: string; location: string
   longitude: number; latitude: number; gpx_file: string; gpx_time_offset: number
   gpx_fallback_mode: string; gpx_max_gap: number; gpx_preview_count: number
-  concurrency: number; timeout: number
+  concurrency: number; timeout: number; auto_mode: boolean
 }
 interface EventInfo { id: string; name: string; date: string }
 interface LogEntry { message: string; level: string; ts: number }
@@ -42,11 +42,12 @@ const gpxTimeOffset = ref(0)
 const gpxFallbackMode = ref('manual')
 const gpxMaxGap = ref(300)
 const gpxPreviewCount = ref(10)
-const concurrency = ref(4)  // 自動模式起始值；手動模式使用者自設
+const concurrency = ref(20)  // 自動模式起始值；手動模式使用者自設
 const autoMode = ref(true)  // true = 自動調整（預設），false = 手動
 // 自動調整用的滑動窗口
 const autoWindow = ref<boolean[]>([])
 const AUTO_WINDOW_SIZE = 20
+const AUTO_MAX_CONCURRENCY = 20
 const timeout = ref(120)
 
 const token = ref('')
@@ -57,6 +58,7 @@ const logs = ref<LogEntry[]>([])
 const progress = ref(0)
 const progressLabel = ref('準備就緒')
 const isUploading = ref(false)
+const failedCount = ref(0)
 
 const showMap = ref(false)
 const showGpxPreview = ref(false)
@@ -96,10 +98,10 @@ onMounted(async () => {
     await listen<string>('auth://token', ({ payload }) => {
       doVerifyToken(payload)
     }),
-    await listen<{ message: string; level: string }>('upload://log', ({ payload }) => {
+    await listen<{ message: string; level: string; auto_result?: 'success' | 'failure' | 'duplicate' }>('upload://log', ({ payload }) => {
       logs.value.push({ ...payload, ts: Date.now() })
-      if (payload.level === 'success') recordAutoResult(true)
-      else if (payload.level === 'error') recordAutoResult(false)
+      if (payload.auto_result === 'success') recordAutoResult(true)
+      else if (payload.auto_result === 'failure') recordAutoResult(false)
       setTimeout(() => {
         if (logPanel.value) logPanel.value.scrollTop = logPanel.value.scrollHeight
       }, 0)
@@ -112,6 +114,7 @@ onMounted(async () => {
       isUploading.value = false
       progress.value = 100
       progressLabel.value = `完成｜成功 ${payload.success}，失敗 ${payload.failed}`
+      void refreshFailedCount()
     }),
   )
 })
@@ -132,7 +135,11 @@ function applyConfig(cfg: AppConfig) {
   gpxFallbackMode.value = cfg.gpx_fallback_mode
   gpxMaxGap.value = cfg.gpx_max_gap
   gpxPreviewCount.value = cfg.gpx_preview_count
-  concurrency.value = cfg.concurrency
+  autoMode.value = cfg.auto_mode ?? true
+  const savedConcurrency = normalizeConcurrency(cfg.concurrency)
+  concurrency.value = autoMode.value
+    ? Math.min(savedConcurrency, AUTO_MAX_CONCURRENCY)
+    : savedConcurrency
   timeout.value = cfg.timeout
   if (cfg.token) doVerifyToken(cfg.token)
 }
@@ -146,7 +153,7 @@ async function saveConfig() {
       gpx_file: gpxFile.value, gpx_time_offset: gpxTimeOffset.value,
       gpx_fallback_mode: gpxFallbackMode.value, gpx_max_gap: gpxMaxGap.value,
       gpx_preview_count: gpxPreviewCount.value, concurrency: concurrency.value,
-      timeout: timeout.value,
+      timeout: timeout.value, auto_mode: autoMode.value,
     }
   }).catch(() => {})
 }
@@ -188,7 +195,17 @@ async function loadEvents() {
       const match = events.value.find(e => e.id === savedEventId.value)
       selectedEventId.value = match ? match.id : (events.value[0]?.id ?? '')
     }
+    await refreshFailedCount()
   } catch {}
+}
+
+async function refreshFailedCount() {
+  const eid = selectedEventId.value || savedEventId.value
+  if (!eid) {
+    failedCount.value = 0
+    return
+  }
+  failedCount.value = await invoke<number>('cmd_get_failed_count', { eventId: eid }).catch(() => 0)
 }
 
 // ── 資料夾 / GPX 選擇 ───────────────────────────────────────────────────────
@@ -242,20 +259,33 @@ async function previewGpx() {
 
 // ── 並行數自動調整 ────────────────────────────────────────────────────────────
 
+function normalizeConcurrency(value: number): number {
+  const n = Number.isFinite(value) ? Math.floor(value) : 1
+  return Math.max(1, n)
+}
+
 // 手動修改並行數 → 切換為手動模式
 function onConcurrencyInput() {
   autoMode.value = false
+  concurrency.value = normalizeConcurrency(concurrency.value)
   invoke('cmd_set_concurrency', { n: concurrency.value }).catch(() => {})
+}
+
+function onConcurrencyChange() {
+  void saveConfig()
 }
 
 function toggleAutoMode() {
   autoMode.value = !autoMode.value
   autoWindow.value = []
   if (autoMode.value) {
-    // 切換自動時，從當前值的一半開始（但不低於 4）
-    concurrency.value = Math.max(4, Math.floor(concurrency.value / 2))
+    concurrency.value = Math.min(normalizeConcurrency(concurrency.value), AUTO_MAX_CONCURRENCY)
+    invoke('cmd_set_auto_concurrency', { n: concurrency.value }).catch(() => {})
+  } else {
+    concurrency.value = normalizeConcurrency(concurrency.value)
     invoke('cmd_set_concurrency', { n: concurrency.value }).catch(() => {})
   }
+  void saveConfig()
 }
 
 // 每次上傳結果（success/error）都會呼叫此函式
@@ -270,16 +300,16 @@ function recordAutoResult(success: boolean) {
   let newVal = concurrency.value
   if (successRate >= 0.95) {
     // 成功率高 → 增加 2
-    newVal = concurrency.value + 2
+    newVal = Math.min(concurrency.value + 2, AUTO_MAX_CONCURRENCY)
   } else if (successRate < 0.8) {
     // 失敗率過高 → 減少 30%
     newVal = Math.max(1, Math.floor(concurrency.value * 0.7))
   }
+  autoWindow.value = [] // 每 20 個結果只做一次決策
   if (newVal !== concurrency.value) {
     concurrency.value = newVal
-    invoke('cmd_set_concurrency', { n: newVal }).catch(() => {})
+    invoke('cmd_set_auto_concurrency', { n: newVal }).catch(() => {})
     addLog(`自動調整並行數 → ${newVal}（成功率 ${Math.round(successRate * 100)}%）`, 'info')
-    autoWindow.value = [] // 重置窗口
   }
 }
 
@@ -297,6 +327,30 @@ function validateInputs(): boolean {
   return true
 }
 
+function validateRetryInputs(): boolean {
+  if (!token.value) { alert('請先登入'); return false }
+  if (!selectedEventId.value && !savedEventId.value) { alert('請選擇活動'); return false }
+  return true
+}
+
+function buildUploadParams() {
+  return {
+    token: token.value,
+    event_id: selectedEventId.value || savedEventId.value,
+    location: location.value,
+    folder: folder.value,
+    longitude: longitude.value || null,
+    latitude: latitude.value || null,
+    gpx_file: gpxFile.value || null,
+    gpx_time_offset: gpxTimeOffset.value,
+    gpx_fallback_mode: gpxFallbackMode.value,
+    gpx_max_gap: gpxMaxGap.value,
+    auto_mode: autoMode.value,
+    concurrency: concurrency.value,
+    timeout_secs: timeout.value,
+  }
+}
+
 async function startUpload() {
   if (!validateInputs()) return
   await saveConfig()
@@ -304,23 +358,27 @@ async function startUpload() {
   progress.value = 0
   progressLabel.value = '準備上傳...'
   autoWindow.value = [] // 重置自動調整窗口
-  const eid = selectedEventId.value || savedEventId.value
 
   await invoke('cmd_start_upload', {
-    params: {
-      token: token.value, event_id: eid,
-      location: location.value, folder: folder.value,
-      longitude: longitude.value || null,
-      latitude: latitude.value || null,
-      gpx_file: gpxFile.value || null,
-      gpx_time_offset: gpxTimeOffset.value,
-      gpx_fallback_mode: gpxFallbackMode.value,
-      gpx_max_gap: gpxMaxGap.value,
-      concurrency: concurrency.value,
-      timeout_secs: timeout.value,
-    }
+    params: buildUploadParams(),
   }).catch((e: unknown) => {
     addLog(`啟動失敗：${e}`, 'error')
+    isUploading.value = false
+  })
+}
+
+async function retryFailed() {
+  if (isUploading.value || failedCount.value === 0 || !validateRetryInputs()) return
+  await saveConfig()
+  isUploading.value = true
+  progress.value = 0
+  progressLabel.value = `準備重試 ${failedCount.value} 張...`
+  autoWindow.value = []
+
+  await invoke('cmd_retry_failed', {
+    params: buildUploadParams(),
+  }).catch((e: unknown) => {
+    addLog(`重試啟動失敗：${e}`, 'error')
     isUploading.value = false
   })
 }
@@ -334,9 +392,16 @@ async function stopUpload() {
 async function clearLog() {
   const eid = selectedEventId.value || savedEventId.value
   if (!eid || !confirm(`確定清除活動 ${eid} 的上傳紀錄？`)) return
-  logs.value = []
-  await invoke('cmd_clear_history', { eventId: eid }).catch(() => {})
-  addLog(`已清除活動 ${eid} 的上傳紀錄`, 'info')
+  try {
+    await invoke('cmd_clear_history', { eventId: eid })
+    logs.value = []
+    progress.value = 0
+    progressLabel.value = '準備就緒'
+    failedCount.value = 0
+    addLog(`已清除活動 ${eid} 的上傳紀錄`, 'info')
+  } catch (e: unknown) {
+    addLog(`清除紀錄失敗：${e}`, 'error')
+  }
 }
 
 function logClass(level: string) {
@@ -374,7 +439,7 @@ function eventLabel(ev: EventInfo) { return `${ev.id} (${ev.name} - ${ev.date})`
         <div class="field">
           <label class="field-label">活動選擇</label>
           <div class="row">
-            <select class="input flex1" v-model="selectedEventId" :disabled="isUploading">
+            <select class="input flex1" v-model="selectedEventId" :disabled="isUploading" @change="refreshFailedCount">
               <option value="">— 請登入後更新活動列表 —</option>
               <option v-for="ev in events" :key="ev.id" :value="ev.id">{{ eventLabel(ev) }}</option>
             </select>
@@ -430,7 +495,7 @@ function eventLabel(ev: EventInfo) { return `${ev.id} (${ev.name} - ${ev.date})`
             <span class="sublabel">並行數</span>
             <input class="input w80" type="number" v-model.number="concurrency" min="1"
               :disabled="isUploading && autoMode"
-              @input="onConcurrencyInput" />
+              @input="onConcurrencyInput" @change="onConcurrencyChange" />
             <button
               :class="['btn', 'btn--sm', autoMode ? 'btn--gold' : 'btn--outline']"
               @click="toggleAutoMode"
@@ -452,6 +517,9 @@ function eventLabel(ev: EventInfo) { return `${ev.id} (${ev.name} - ${ev.date})`
         <p class="progress-label">{{ progressLabel }}</p>
         <div class="btn-row">
           <button class="btn btn--primary btn--lg" @click="startUpload" :disabled="isUploading">開始上傳</button>
+          <button class="btn btn--gold btn--lg" @click="retryFailed" :disabled="isUploading || failedCount === 0 || !token">
+            重試失敗 ({{ failedCount }})
+          </button>
           <button class="btn btn--dark btn--lg" @click="stopUpload" :disabled="!isUploading">停止</button>
           <button class="btn btn--outline btn--lg" @click="clearLog" :disabled="isUploading">清除紀錄</button>
         </div>
@@ -747,9 +815,7 @@ select.input {
 
 /* ── 操作按鈕列 ── */
 .btn-row { display: flex; gap: 10px; margin-top: 10px; }
-.btn-row .btn--primary { flex: 2; }
-.btn-row .btn--dark,
-.btn-row .btn--outline { flex: 1; }
+.btn-row .btn { flex: 1; min-width: 0; }
 
 /* ── 進階設定 ── */
 .advanced { margin-top: 8px; }

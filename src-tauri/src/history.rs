@@ -14,6 +14,11 @@ fn db_path() -> PathBuf {
 
 pub fn open_db() -> Result<Connection> {
     let conn = Connection::open(db_path())?;
+    initialize_schema(&conn)?;
+    Ok(conn)
+}
+
+fn initialize_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch("
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
@@ -31,14 +36,48 @@ pub fn open_db() -> Result<Connection> {
             ON uploads(event_id, sha256_head);
         CREATE INDEX IF NOT EXISTS idx_event_path
             ON uploads(event_id, abs_path);
+        CREATE TABLE IF NOT EXISTS failed_uploads (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id       TEXT NOT NULL,
+            abs_path       TEXT NOT NULL,
+            file_size      INTEGER NOT NULL,
+            mtime_ns       INTEGER NOT NULL,
+            sha256_head    TEXT NOT NULL,
+            location       TEXT NOT NULL,
+            longitude      REAL,
+            latitude       REAL,
+            last_error     TEXT NOT NULL,
+            attempts       INTEGER NOT NULL DEFAULT 1,
+            last_failed_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_failed_event_path
+            ON failed_uploads(event_id, abs_path);
+        CREATE INDEX IF NOT EXISTS idx_failed_event
+            ON failed_uploads(event_id);
     ")?;
-    Ok(conn)
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
 pub enum DupCheck {
     Duplicate { photo_id: Option<String> },
     New,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailedUpload {
+    pub id: i64,
+    pub event_id: String,
+    pub abs_path: String,
+    pub file_size: i64,
+    pub mtime_ns: i64,
+    pub sha256_head: String,
+    pub location: String,
+    pub longitude: Option<f64>,
+    pub latitude: Option<f64>,
+    pub last_error: String,
+    pub attempts: i64,
+    pub last_failed_at: String,
 }
 
 /// 三層去重檢查：
@@ -106,15 +145,109 @@ pub fn record_upload(
          VALUES (?, ?, ?, ?, ?, ?, ?)",
         params![event_id, photo_id, abs_path, file_size, mtime_ns, sha256_head, now],
     )?;
+    remove_failed_upload(conn, event_id, abs_path)?;
     Ok(())
 }
 
 pub fn clear_event_history(conn: &Connection, event_id: &str) -> Result<usize> {
-    let n = conn.execute(
+    let uploads = conn.execute(
         "DELETE FROM uploads WHERE event_id=?",
         params![event_id],
     )?;
-    Ok(n)
+    let failed = conn.execute(
+        "DELETE FROM failed_uploads WHERE event_id=?",
+        params![event_id],
+    )?;
+    Ok(uploads + failed)
+}
+
+pub fn record_failed_upload(
+    conn: &Connection,
+    event_id: &str,
+    abs_path: &str,
+    file_size: i64,
+    mtime_ns: i64,
+    sha256_head: &str,
+    location: &str,
+    longitude: Option<f64>,
+    latitude: Option<f64>,
+    last_error: &str,
+) -> Result<()> {
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.execute(
+        "INSERT INTO failed_uploads
+            (event_id, abs_path, file_size, mtime_ns, sha256_head, location,
+             longitude, latitude, last_error, attempts, last_failed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+         ON CONFLICT(event_id, abs_path) DO UPDATE SET
+            file_size=excluded.file_size,
+            mtime_ns=excluded.mtime_ns,
+            sha256_head=excluded.sha256_head,
+            location=excluded.location,
+            longitude=excluded.longitude,
+            latitude=excluded.latitude,
+            last_error=excluded.last_error,
+            attempts=failed_uploads.attempts + 1,
+            last_failed_at=excluded.last_failed_at",
+        params![
+            event_id,
+            abs_path,
+            file_size,
+            mtime_ns,
+            sha256_head,
+            location,
+            longitude,
+            latitude,
+            last_error,
+            now,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn remove_failed_upload(conn: &Connection, event_id: &str, abs_path: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM failed_uploads WHERE event_id=? AND abs_path=?",
+        params![event_id, abs_path],
+    )?;
+    Ok(())
+}
+
+pub fn list_failed_uploads(conn: &Connection, event_id: &str) -> Result<Vec<FailedUpload>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, event_id, abs_path, file_size, mtime_ns, sha256_head,
+                location, longitude, latitude, last_error, attempts, last_failed_at
+         FROM failed_uploads
+         WHERE event_id=?
+         ORDER BY id",
+    )?;
+    let rows = stmt.query_map(params![event_id], |row| {
+        Ok(FailedUpload {
+            id: row.get(0)?,
+            event_id: row.get(1)?,
+            abs_path: row.get(2)?,
+            file_size: row.get(3)?,
+            mtime_ns: row.get(4)?,
+            sha256_head: row.get(5)?,
+            location: row.get(6)?,
+            longitude: row.get(7)?,
+            latitude: row.get(8)?,
+            last_error: row.get(9)?,
+            attempts: row.get(10)?,
+            last_failed_at: row.get(11)?,
+        })
+    })?;
+
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn count_failed_uploads(conn: &Connection, event_id: &str) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM failed_uploads WHERE event_id=?",
+        params![event_id],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
 }
 
 /// 計算檔案前 512KB 的 SHA-256（速度與可靠度的平衡點）
@@ -150,5 +283,75 @@ impl FileInfo {
             file_size: meta.len() as i64,
             mtime_ns,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    #[test]
+    fn failed_upload_lifecycle_is_persistent_and_clearable() {
+        let conn = Connection::open_in_memory().unwrap();
+        initialize_schema(&conn).unwrap();
+
+        record_failed_upload(
+            &conn,
+            "event-1",
+            "/photos/a.jpg",
+            100,
+            200,
+            "hash-a",
+            "終點線",
+            Some(25.0),
+            Some(121.0),
+            "timeout",
+        )
+        .unwrap();
+        assert_eq!(count_failed_uploads(&conn, "event-1").unwrap(), 1);
+
+        record_failed_upload(
+            &conn,
+            "event-1",
+            "/photos/a.jpg",
+            100,
+            200,
+            "hash-a",
+            "終點線",
+            Some(25.0),
+            Some(121.0),
+            "connection closed",
+        )
+        .unwrap();
+        assert_eq!(list_failed_uploads(&conn, "event-1").unwrap()[0].attempts, 2);
+
+        record_upload(
+            &conn,
+            "event-1",
+            Some("photo-1"),
+            "/photos/a.jpg",
+            100,
+            200,
+            "hash-a",
+        )
+        .unwrap();
+        assert_eq!(count_failed_uploads(&conn, "event-1").unwrap(), 0);
+
+        record_failed_upload(
+            &conn,
+            "event-1",
+            "/photos/b.jpg",
+            100,
+            200,
+            "hash-b",
+            "終點線",
+            Some(25.0),
+            Some(121.0),
+            "timeout",
+        )
+        .unwrap();
+        assert_eq!(clear_event_history(&conn, "event-1").unwrap(), 2);
+        assert_eq!(count_failed_uploads(&conn, "event-1").unwrap(), 0);
     }
 }

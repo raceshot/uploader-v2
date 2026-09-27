@@ -6,6 +6,8 @@ mod history;
 mod scanner;
 mod uploader;
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
@@ -14,8 +16,11 @@ use tauri::{AppHandle, Emitter, State};
 use config::AppConfig;
 use error::AppError;
 use gpx::GpxContext;
-use history::{check_duplicate, compute_sha256_head, open_db, record_upload, DupCheck};
-use scanner::scan_folder;
+use history::{
+    check_duplicate, compute_sha256_head, count_failed_uploads, list_failed_uploads,
+    open_db, record_failed_upload, record_upload, remove_failed_upload, DupCheck, FailedUpload,
+};
+use scanner::{scan_folder, ScannedFile};
 use uploader::{upload_single, verify_token, list_events, choose_endpoint, UploadParams};
 
 // ── App 狀態 ─────────────────────────────────────────────────────────────────
@@ -33,6 +38,8 @@ pub struct AppState {
 struct LogEvent {
     message: String,
     level: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_result: Option<&'static str>,
 }
 
 #[derive(Clone, Serialize)]
@@ -215,6 +222,48 @@ async fn cmd_start_upload(
     state: State<'_, AppState>,
     params: UploadParams,
 ) -> Result<(), AppError> {
+    spawn_upload_task(app, &state, params, None)
+}
+
+#[tauri::command]
+async fn cmd_retry_failed(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    params: UploadParams,
+) -> Result<(), AppError> {
+    let failed = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| AppError::Other("DB 鎖定失敗".to_string()))?;
+        list_failed_uploads(&db, &params.event_id)?
+    };
+
+    if failed.is_empty() {
+        return Err(AppError::Other("目前沒有可重試的失敗項目".to_string()));
+    }
+
+    spawn_upload_task(app, &state, params, Some(failed))
+}
+
+#[tauri::command]
+async fn cmd_get_failed_count(
+    state: State<'_, AppState>,
+    event_id: String,
+) -> Result<usize, AppError> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| AppError::Other("DB 鎖定失敗".to_string()))?;
+    count_failed_uploads(&db, &event_id)
+}
+
+fn spawn_upload_task(
+    app: AppHandle,
+    state: &AppState,
+    params: UploadParams,
+    retry_files: Option<Vec<FailedUpload>>,
+) -> Result<(), AppError> {
     if state.upload_running.swap(true, Ordering::SeqCst) {
         return Err(AppError::Other("上傳已在執行中".to_string()));
     }
@@ -224,20 +273,43 @@ async fn cmd_start_upload(
     let client = state.http_client.clone();
     let live_concurrency = Arc::clone(&state.upload_concurrency);
     // 以前端傳入的並行數作為初始值
-    live_concurrency.store(params.concurrency as usize, Ordering::Relaxed);
+    live_concurrency.store(
+        effective_concurrency(params.concurrency, params.auto_mode),
+        Ordering::Relaxed,
+    );
 
     tokio::spawn(async move {
-        let result = run_upload(&app, &client, &db_arc, &running, &live_concurrency, &params).await;
+        let result = run_upload(
+            &app,
+            &client,
+            &db_arc,
+            &running,
+            &live_concurrency,
+            &params,
+            retry_files,
+        )
+        .await;
         running.store(false, Ordering::SeqCst);
         if let Err(e) = result {
             let _ = app.emit("upload://log", LogEvent {
                 message: format!("上傳錯誤：{e}"),
                 level: "error".to_string(),
+                auto_result: None,
             });
         }
     });
 
     Ok(())
+}
+
+fn effective_concurrency(requested: u32, auto_mode: bool) -> usize {
+    let requested = requested.max(1);
+    let effective = if auto_mode {
+        requested.min(config::AUTO_MAX_CONCURRENCY)
+    } else {
+        requested
+    };
+    effective as usize
 }
 
 async fn run_upload(
@@ -247,16 +319,48 @@ async fn run_upload(
     running: &Arc<AtomicBool>,
     live_concurrency: &Arc<AtomicUsize>,
     params: &UploadParams,
+    retry_files: Option<Vec<FailedUpload>>,
 ) -> error::Result<()> {
-    let folder = std::path::Path::new(&params.folder);
-    let all_files = scan_folder(folder);
+    let retry_mode = retry_files.is_some();
+    let retry_map: HashMap<String, FailedUpload> = retry_files
+        .unwrap_or_default()
+        .into_iter()
+        .map(|failed| (failed.abs_path.clone(), failed))
+        .collect();
+    let all_files = if retry_mode {
+        retry_map
+            .values()
+            .map(|failed| {
+                ScannedFile::from_path(Path::new(&failed.abs_path)).unwrap_or_else(|_| {
+                    ScannedFile {
+                        abs_path: failed.abs_path.clone(),
+                        file_name: Path::new(&failed.abs_path)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| failed.abs_path.clone()),
+                        file_size: failed.file_size,
+                        mtime_ns: failed.mtime_ns,
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        scan_folder(Path::new(&params.folder))
+    };
 
     let _ = app.emit("upload://log", LogEvent {
-        message: format!("掃描完成：共 {} 張圖片", all_files.len()),
+        message: if retry_mode {
+            format!("準備重試：共 {} 張失敗照片", all_files.len())
+        } else {
+            format!("掃描完成：共 {} 張圖片", all_files.len())
+        },
         level: "info".to_string(),
+        auto_result: None,
     });
 
-    let gpx_ctx: Option<GpxContext> = if let Some(ref gpx_path) = params.gpx_file {
+    let gpx_ctx: Option<GpxContext> = if retry_mode {
+        None
+    } else if let Some(ref gpx_path) = params.gpx_file {
         match gpx::parse_gpx(std::path::Path::new(gpx_path)) {
             Ok(pts) => Some(GpxContext {
                 track_points: pts,
@@ -270,6 +374,7 @@ async fn run_upload(
                 let _ = app.emit("upload://log", LogEvent {
                     message: format!("GPX 載入失敗：{e}，將使用手動座標"),
                     level: "warn".to_string(),
+                    auto_result: None,
                 });
                 None
             }
@@ -292,6 +397,7 @@ async fn run_upload(
             let _ = app.emit("upload://log", LogEvent {
                 message: "上傳已停止".to_string(),
                 level: "warn".to_string(),
+                auto_result: None,
             });
             break;
         }
@@ -302,11 +408,27 @@ async fn run_upload(
             if s { success += 1; } else { failed += 1; }
         }
 
-        let hash = compute_sha256_head(std::path::Path::new(&f.abs_path)).unwrap_or_default();
+        let retry_info = retry_map.get(&f.abs_path);
+        let hash = compute_sha256_head(Path::new(&f.abs_path)).unwrap_or_else(|_| {
+            retry_info
+                .map(|failed| failed.sha256_head.clone())
+                .unwrap_or_default()
+        });
 
-        let dup = {
-            let db = db_arc.lock().map_err(|_| AppError::Other("DB lock 失敗".to_string()))?;
-            check_duplicate(&db, &params.event_id, &f.abs_path, f.file_size, f.mtime_ns, &hash)?
+        let dup = if retry_info.is_some() {
+            DupCheck::New
+        } else {
+            let db = db_arc
+                .lock()
+                .map_err(|_| AppError::Other("DB lock 失敗".to_string()))?;
+            check_duplicate(
+                &db,
+                &params.event_id,
+                &f.abs_path,
+                f.file_size,
+                f.mtime_ns,
+                &hash,
+            )?
         };
 
         current += 1;
@@ -317,9 +439,13 @@ async fn run_upload(
         });
 
         if let DupCheck::Duplicate { .. } = dup {
+            let _ = db_arc.lock().map(|db| {
+                remove_failed_upload(&db, &params.event_id, &f.abs_path).ok()
+            });
             let _ = app.emit("upload://log", LogEvent {
                 message: format!("⏭ 跳過（已上傳）：{}", f.file_name),
                 level: "info".to_string(),
+                auto_result: None,
             });
             success += 1;
             continue;
@@ -336,8 +462,10 @@ async fn run_upload(
             }
         }
 
-        let (lon, lat) = if let Some(ref ctx) = gpx_ctx {
-            let coord = gpx::match_photo(std::path::Path::new(&f.abs_path), ctx);
+        let (lon, lat) = if let Some(failed) = retry_info {
+            (failed.longitude, failed.latitude)
+        } else if let Some(ref ctx) = gpx_ctx {
+            let coord = gpx::match_photo(Path::new(&f.abs_path), ctx);
             (coord.lon, coord.lat)
         } else {
             (params.longitude, params.latitude)
@@ -347,7 +475,9 @@ async fn run_upload(
         let client_clone = client.clone();
         let token = params.token.clone();
         let event_id = params.event_id.clone();
-        let location = params.location.clone();
+        let location = retry_info
+            .map(|failed| failed.location.clone())
+            .unwrap_or_else(|| params.location.clone());
         let endpoint_clone = endpoint.clone();
         let timeout = params.timeout_secs;
         let abs_path = f.abs_path.clone();
@@ -367,20 +497,50 @@ async fn run_upload(
                 lon, lat, &endpoint_clone, timeout, 3,
             ).await;
 
+            let error_message = result
+                .error
+                .as_deref()
+                .filter(|message| !message.is_empty())
+                .unwrap_or(&result.message)
+                .to_string();
+
             if result.success {
                 let _ = db_arc_clone.lock().map(|db| {
                     record_upload(&db, &event_id, result.photo_id.as_deref(),
                         &abs_path, file_size, mtime_ns, &hash_clone).ok()
                 });
+                let auto_result = if result.status_code == Some(409)
+                    || result.message == "已上傳（視為成功）"
+                {
+                    Some("duplicate")
+                } else {
+                    Some("success")
+                };
                 let _ = app_clone.emit("upload://log", LogEvent {
                     message: format!("✅ 成功：{}", file_name),
                     level: "success".to_string(),
+                    auto_result,
                 });
             } else {
+                let _ = db_arc_clone.lock().map(|db| {
+                    record_failed_upload(
+                        &db,
+                        &event_id,
+                        &abs_path,
+                        file_size,
+                        mtime_ns,
+                        &hash_clone,
+                        &location,
+                        lon,
+                        lat,
+                        &error_message,
+                    )
+                    .ok()
+                });
                 let _ = app_clone.emit("upload://log", LogEvent {
-                    message: format!("❌ 失敗：{} - {}", file_name,
-                        result.error.as_deref().unwrap_or("")),
+                    message: format!("❌ 失敗：{} - {}", file_name, error_message),
                     level: "error".to_string(),
+                    auto_result: Some("failure"),
                 });
             }
 
@@ -403,6 +563,7 @@ async fn run_upload(
     let _ = app.emit("upload://log", LogEvent {
         message: format!("完成｜成功 {}，失敗 {}", success, failed),
         level: "info".to_string(),
+        auto_result: None,
     });
     let _ = app.emit("upload://finished", FinishedEvent { success, failed });
 
@@ -418,6 +579,18 @@ async fn cmd_stop_upload(state: State<'_, AppState>) -> Result<(), AppError> {
 #[tauri::command]
 async fn cmd_set_concurrency(state: State<'_, AppState>, n: usize) -> Result<(), AppError> {
     let n = n.max(1);
+    state.upload_concurrency.store(n, Ordering::Relaxed);
+    Ok(())
+}
+
+#[tauri::command]
+async fn cmd_set_auto_concurrency(
+    state: State<'_, AppState>,
+    n: usize,
+) -> Result<(), AppError> {
+    let n = n
+        .max(1)
+        .min(config::AUTO_MAX_CONCURRENCY as usize);
     state.upload_concurrency.store(n, Ordering::Relaxed);
     Ok(())
 }
@@ -458,10 +631,25 @@ pub fn run() {
             cmd_scan_folder,
             cmd_preview_gpx,
             cmd_start_upload,
+            cmd_retry_failed,
+            cmd_get_failed_count,
             cmd_stop_upload,
             cmd_set_concurrency,
+            cmd_set_auto_concurrency,
             cmd_clear_history,
         ])
         .run(tauri::generate_context!())
         .expect("Tauri 啟動失敗");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_concurrency;
+
+    #[test]
+    fn auto_mode_is_capped_but_manual_mode_is_not() {
+        assert_eq!(effective_concurrency(50, true), 20);
+        assert_eq!(effective_concurrency(50, false), 50);
+        assert_eq!(effective_concurrency(0, true), 1);
+    }
 }

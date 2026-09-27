@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+pub const AUTO_MAX_CONCURRENCY: u32 = 20;
+
+fn default_auto_mode() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub token: String,
@@ -16,6 +22,8 @@ pub struct AppConfig {
     pub gpx_preview_count: u32,
     pub concurrency: u32,
     pub timeout: u32,
+    #[serde(default = "default_auto_mode")]
+    pub auto_mode: bool,
 }
 
 impl Default for AppConfig {
@@ -34,6 +42,7 @@ impl Default for AppConfig {
             gpx_preview_count: 50,
             concurrency: 20,
             timeout: 120,
+            auto_mode: true,
         }
     }
 }

@@ -6,6 +6,10 @@ use crate::error::{AppError, Result};
 
 const API_BASE: &str = "https://api.raceshot.app";
 
+fn default_auto_mode() -> bool {
+    true
+}
+
 pub fn photographer_upload_url() -> String {
     format!("{}/api/v1/photographer/upload", API_BASE)
 }
@@ -82,6 +86,8 @@ pub struct UploadParams {
     pub gpx_max_gap: u32,
     #[serde(default)]
     pub reupload_failures: bool,
+    #[serde(default = "default_auto_mode")]
+    pub auto_mode: bool,
 }
 
 // ── API 呼叫 ─────────────────────────────────────────────────────────────────
