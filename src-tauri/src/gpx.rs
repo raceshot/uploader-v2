@@ -163,7 +163,7 @@ pub fn interpolate(
 
 // ── EXIF 時間擷取 ─────────────────────────────────────────────────────────────
 
-pub fn extract_exif_timestamp_ms(path: &Path) -> Option<i64> {
+fn read_exif_datetime_fields(path: &Path) -> Option<(String, Option<String>, Option<String>)> {
     use exif::{In, Reader, Tag};
     use std::io::BufReader;
 
@@ -189,7 +189,31 @@ pub fn extract_exif_timestamp_ms(path: &Path) -> Option<i64> {
         .or_else(|| exif.get_field(Tag::SubSecTime, In::PRIMARY))
         .map(|f| f.display_value().to_string());
 
+    Some((date_str, offset_str, subsec_str))
+}
+
+pub fn extract_exif_timestamp_ms(path: &Path) -> Option<i64> {
+    let (date_str, offset_str, subsec_str) = read_exif_datetime_fields(path)?;
     parse_exif_datetime(&date_str, offset_str.as_deref(), subsec_str.as_deref())
+}
+
+pub fn extract_exif_local_time_minutes(path: &Path) -> Option<u16> {
+    let (date_str, _, _) = read_exif_datetime_fields(path)?;
+    parse_exif_local_time_minutes(&date_str)
+}
+
+fn parse_exif_local_time_minutes(date_str: &str) -> Option<u16> {
+    let cleaned = date_str.trim().replace('"', "");
+    if cleaned.len() < 16 {
+        return None;
+    }
+
+    let hour: u16 = cleaned[11..13].parse().ok()?;
+    let minute: u16 = cleaned[14..16].parse().ok()?;
+    if hour > 23 || minute > 59 {
+        return None;
+    }
+    Some(hour * 60 + minute)
 }
 
 fn parse_exif_datetime(date_str: &str, offset: Option<&str>, subsec: Option<&str>) -> Option<i64> {
@@ -241,6 +265,14 @@ fn parse_exif_datetime(date_str: &str, offset: Option<&str>, subsec: Option<&str
     );
     let utc_secs = naive.and_utc().timestamp() - offset_secs;
     Some(utc_secs * 1000 + subsec_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn preview_time_uses_exif_wall_clock_time() {
+        assert_eq!(super::parse_exif_local_time_minutes("2026:09:25 16:04:28"), Some(16 * 60 + 4));
+    }
 }
 
 // ── 對單張照片做 GPX 匹配 ────────────────────────────────────────────────────

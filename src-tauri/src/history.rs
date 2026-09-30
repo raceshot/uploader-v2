@@ -140,9 +140,15 @@ pub fn record_upload(
 ) -> Result<()> {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     conn.execute(
-        "INSERT OR IGNORE INTO uploads
+        "INSERT INTO uploads
             (event_id, photo_id, abs_path, file_size, mtime_ns, sha256_head, uploaded_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(event_id, sha256_head) DO UPDATE SET
+            photo_id=COALESCE(excluded.photo_id, uploads.photo_id),
+            abs_path=excluded.abs_path,
+            file_size=excluded.file_size,
+            mtime_ns=excluded.mtime_ns,
+            uploaded_at=excluded.uploaded_at",
         params![event_id, photo_id, abs_path, file_size, mtime_ns, sha256_head, now],
     )?;
     remove_failed_upload(conn, event_id, abs_path)?;
@@ -337,6 +343,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(count_failed_uploads(&conn, "event-1").unwrap(), 0);
+
+        record_upload(
+            &conn,
+            "event-1",
+            Some("photo-1-confirmed"),
+            "/photos/a-renamed.jpg",
+            101,
+            201,
+            "hash-a",
+        )
+        .unwrap();
+        assert!(matches!(
+            check_duplicate(&conn, "event-1", "/photos/a-renamed.jpg", 101, 201, "hash-a")
+                .unwrap(),
+            DupCheck::Duplicate { photo_id: Some(ref id) } if id == "photo-1-confirmed"
+        ));
 
         record_failed_upload(
             &conn,

@@ -21,7 +21,10 @@ use history::{
     open_db, record_failed_upload, record_upload, remove_failed_upload, DupCheck, FailedUpload,
 };
 use scanner::{scan_folder, ScannedFile};
-use uploader::{upload_single, verify_token, list_events, choose_endpoint, UploadParams};
+use uploader::{
+    list_events, list_featured_photo_ids, set_photo_featured, upload_single, verify_token,
+    choose_endpoint, UploadParams,
+};
 
 // ── App 狀態 ─────────────────────────────────────────────────────────────────
 
@@ -47,6 +50,17 @@ struct ProgressEvent {
     current: usize,
     total: usize,
     file_name: String,
+    abs_path: String,
+}
+
+#[derive(Clone, Serialize)]
+struct UploadResultEvent {
+    file_name: String,
+    abs_path: String,
+    success: bool,
+    duplicate: bool,
+    photo_id: Option<String>,
+    message: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -113,6 +127,15 @@ struct ScanSummary {
     skipped: usize,
 }
 
+#[derive(Serialize)]
+struct PreviewFile {
+    abs_path: String,
+    file_name: String,
+    file_size: i64,
+    mtime_ns: i64,
+    capture_time_minutes: Option<u16>,
+}
+
 #[tauri::command]
 async fn cmd_scan_folder(
     state: State<'_, AppState>,
@@ -136,6 +159,62 @@ async fn cmd_scan_folder(
     }
 
     Ok(ScanSummary { total, to_upload: total - skipped, skipped })
+}
+
+#[tauri::command]
+async fn cmd_preview_photos(folder: String) -> Result<Vec<PreviewFile>, AppError> {
+    Ok(scan_folder(Path::new(&folder))
+        .into_iter()
+        .map(|file| PreviewFile {
+            capture_time_minutes: None,
+            abs_path: file.abs_path,
+            file_name: file.file_name,
+            file_size: file.file_size,
+            mtime_ns: file.mtime_ns,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn cmd_preview_capture_times(
+    paths: Vec<String>,
+) -> Result<HashMap<String, Option<u16>>, AppError> {
+    Ok(paths
+        .into_iter()
+        .map(|path| {
+            let minutes = gpx::extract_exif_local_time_minutes(Path::new(&path));
+            (path, minutes)
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn cmd_list_featured_photo_ids(
+    state: State<'_, AppState>,
+    token: String,
+    event_id: String,
+) -> Result<Vec<String>, AppError> {
+    list_featured_photo_ids(&state.http_client, &token, &event_id, 30).await
+}
+
+#[tauri::command]
+async fn cmd_set_photo_featured(
+    state: State<'_, AppState>,
+    token: String,
+    event_id: String,
+    photo_id: String,
+    is_featured: bool,
+    timeout_secs: u64,
+) -> Result<(), AppError> {
+    set_photo_featured(
+        &state.http_client,
+        &token,
+        &event_id,
+        &photo_id,
+        is_featured,
+        timeout_secs,
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -436,9 +515,10 @@ async fn run_upload(
             current,
             total,
             file_name: f.file_name.clone(),
+            abs_path: f.abs_path.clone(),
         });
 
-        if let DupCheck::Duplicate { .. } = dup {
+        if let DupCheck::Duplicate { photo_id } = dup {
             let _ = db_arc.lock().map(|db| {
                 remove_failed_upload(&db, &params.event_id, &f.abs_path).ok()
             });
@@ -446,6 +526,14 @@ async fn run_upload(
                 message: format!("⏭ 跳過（已上傳）：{}", f.file_name),
                 level: "info".to_string(),
                 auto_result: None,
+            });
+            let _ = app.emit("upload://result", UploadResultEvent {
+                file_name: f.file_name.clone(),
+                abs_path: f.abs_path.clone(),
+                success: true,
+                duplicate: true,
+                photo_id,
+                message: "已上傳（本機紀錄）".to_string(),
             });
             success += 1;
             continue;
@@ -544,6 +632,16 @@ async fn run_upload(
                 });
             }
 
+            let _ = app_clone.emit("upload://result", UploadResultEvent {
+                file_name: result.file_name.clone(),
+                abs_path: result.abs_path.clone(),
+                success: result.success,
+                duplicate: result.status_code == Some(409)
+                    || result.message == "已上傳（視為成功）",
+                photo_id: result.photo_id.clone(),
+                message: result.error.clone().unwrap_or(result.message.clone()),
+            });
+
             let _ = done_tx_clone.send(result.success);
         });
     }
@@ -629,6 +727,10 @@ pub fn run() {
             cmd_list_events,
             cmd_start_auth_server,
             cmd_scan_folder,
+            cmd_preview_photos,
+            cmd_preview_capture_times,
+            cmd_list_featured_photo_ids,
+            cmd_set_photo_featured,
             cmd_preview_gpx,
             cmd_start_upload,
             cmd_retry_failed,

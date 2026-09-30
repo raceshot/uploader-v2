@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
-import { invoke } from '@tauri-apps/api/core'
-import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
+import { emit, listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { WebviewWindow } from '@tauri-apps/api/webviewWindow'
 import { open as openDialog } from '@tauri-apps/plugin-dialog'
 import { check } from '@tauri-apps/plugin-updater'
 import { relaunch } from '@tauri-apps/plugin-process'
@@ -18,6 +19,29 @@ interface AppConfig {
 }
 interface EventInfo { id: string; name: string; date: string }
 interface LogEntry { message: string; level: string; ts: number }
+interface PreviewFile {
+  abs_path: string; file_name: string; file_size: number; mtime_ns: number
+  capture_time_minutes: number | null
+}
+type PhotoUploadStatus = 'pending' | 'uploading' | 'success' | 'duplicate' | 'failed'
+type FeaturedSyncStatus = 'idle' | 'syncing' | 'synced' | 'error'
+interface PreviewPhoto extends PreviewFile {
+  previewUrl: string
+  photoId: string | null
+  status: PhotoUploadStatus
+  isFeatured: boolean
+  featuredSync: FeaturedSyncStatus
+  thumbnailError: boolean
+  message: string
+}
+interface UploadResultEvent {
+  file_name: string; abs_path: string; success: boolean; duplicate: boolean
+  photo_id: string | null; message: string
+}
+interface PreviewContext {
+  folder: string
+  eventId: string
+}
 export interface GpxPreviewRow {
   file_name: string; abs_path: string; capture_time_utc: string | null
   source: string; coord: string | null
@@ -26,6 +50,8 @@ export interface GpxPreviewRow {
 }
 
 // ── 狀態 ───────────────────────────────────────────────────────────────────
+
+const isPreviewWindow = new URLSearchParams(window.location.search).get('window') === 'preview'
 
 const loginStatus = ref<'none' | 'pending' | 'ok' | 'fail'>('none')
 const loginLabel = ref('未登入')
@@ -59,6 +85,63 @@ const progress = ref(0)
 const progressLabel = ref('準備就緒')
 const isUploading = ref(false)
 const failedCount = ref(0)
+const previewPhotos = ref<PreviewPhoto[]>([])
+const previewLoading = ref(false)
+const previewPage = ref(1)
+const previewPageInput = ref(1)
+const captureTimeFilter = ref<'all' | 'with-time' | 'without-time'>('all')
+const captureTimeFrom = ref('')
+const captureTimeTo = ref('')
+const captureTimesLoading = ref(false)
+const captureTimesLoaded = ref(false)
+const captureTimesError = ref('')
+const existingFeaturedIds = ref<string[]>([])
+const existingFeaturedLoading = ref(false)
+const featuredTouchedPaths = new Set<string>()
+const featureSyncQueues = new Map<string, Promise<void>>()
+let previewRequestId = 0
+const PREVIEW_PAGE_SIZE = 120
+
+const currentEventId = computed(() => selectedEventId.value || savedEventId.value)
+const isOrganizationTarget = computed(() => currentEventId.value.startsWith('org_'))
+const featuredLimit = computed(() => isOrganizationTarget.value ? null : 10)
+const featuredCount = computed(() => {
+  const ids = new Set(existingFeaturedIds.value)
+  let pendingCount = 0
+  for (const photo of previewPhotos.value) {
+    if (!photo.isFeatured) continue
+    if (photo.photoId) ids.add(photo.photoId)
+    else pendingCount += 1
+  }
+  return ids.size + pendingCount
+})
+const captureTimeFilterActive = computed(() => (
+  captureTimeFilter.value !== 'all' || Boolean(captureTimeFrom.value) || Boolean(captureTimeTo.value)
+))
+const filteredPreviewPhotos = computed(() => previewPhotos.value.filter(photo => {
+  if (captureTimeFilterActive.value && !captureTimesLoaded.value) return false
+  if (captureTimeFilter.value === 'with-time' && photo.capture_time_minutes === null) return false
+  if (captureTimeFilter.value === 'without-time' && photo.capture_time_minutes !== null) return false
+  if (photo.capture_time_minutes === null) return !captureTimeFrom.value && !captureTimeTo.value
+
+  const minutes = photo.capture_time_minutes
+  const from = parseTimeInputMinutes(captureTimeFrom.value)
+  const to = parseTimeInputMinutes(captureTimeTo.value)
+  if (from !== null && minutes < from) return false
+  if (to !== null && minutes > to) return false
+  return true
+}))
+const previewPageCount = computed(() => Math.max(1, Math.ceil(filteredPreviewPhotos.value.length / PREVIEW_PAGE_SIZE)))
+const visiblePreviewPhotos = computed(() => {
+  const start = (previewPage.value - 1) * PREVIEW_PAGE_SIZE
+  return filteredPreviewPhotos.value.slice(start, start + PREVIEW_PAGE_SIZE)
+})
+
+watch([captureTimeFilter, captureTimeFrom, captureTimeTo], () => {
+  previewPage.value = 1
+  previewPageInput.value = 1
+  if (captureTimeFilterActive.value) void loadCaptureTimes()
+})
 
 const showMap = ref(false)
 const showGpxPreview = ref(false)
@@ -88,11 +171,55 @@ async function checkForUpdates() {
   }
 }
 
+async function notifyPreviewContext() {
+  if (!isPreviewWindow) {
+    await emit<PreviewContext>('preview://context', {
+      folder: folder.value,
+      eventId: currentEventId.value,
+    }).catch(() => {})
+  }
+}
+
+async function openPreviewWindow() {
+  await saveConfig()
+
+  const existing = await WebviewWindow.getByLabel('photo-preview')
+  if (existing) {
+    await existing.show()
+    await existing.setFocus()
+    await notifyPreviewContext()
+    return
+  }
+
+  const preview = new WebviewWindow('photo-preview', {
+    url: '/?window=preview',
+    title: '相片預覽 · 運動拍檔',
+    width: 1200,
+    height: 860,
+    minWidth: 900,
+    minHeight: 650,
+    resizable: true,
+    center: true,
+  })
+  preview.once('tauri://error', ({ payload }) => {
+    addLog(`開啟相片預覽失敗：${payload}`, 'error')
+  })
+}
+
 onMounted(async () => {
   const cfg = await invoke<AppConfig>('cmd_get_config')
   applyConfig(cfg)
 
-  checkForUpdates()
+  if (!isPreviewWindow) checkForUpdates()
+
+  if (isPreviewWindow) {
+    unlisteners.push(await listen<PreviewContext>('preview://context', ({ payload }) => {
+      folder.value = payload.folder
+      selectedEventId.value = payload.eventId
+      savedEventId.value = payload.eventId
+      void scanPreview()
+    }))
+  }
 
   unlisteners.push(
     await listen<string>('auth://token', ({ payload }) => {
@@ -106,9 +233,17 @@ onMounted(async () => {
         if (logPanel.value) logPanel.value.scrollTop = logPanel.value.scrollHeight
       }, 0)
     }),
-    await listen<{ current: number; total: number; file_name: string }>('upload://progress', ({ payload }) => {
-      progress.value = Math.round(payload.current / payload.total * 100)
+    await listen<{ current: number; total: number; file_name: string; abs_path: string }>('upload://progress', ({ payload }) => {
+      isUploading.value = true
+      progress.value = payload.total > 0 ? Math.round(payload.current / payload.total * 100) : 0
       progressLabel.value = `上傳中：${payload.current} / ${payload.total}`
+      const photo = previewPhotos.value.find(item => item.abs_path === payload.abs_path)
+      if (photo && photo.status !== 'success' && photo.status !== 'duplicate') {
+        photo.status = 'uploading'
+      }
+    }),
+    await listen<UploadResultEvent>('upload://result', ({ payload }) => {
+      handleUploadResult(payload)
     }),
     await listen<{ success: number; failed: number }>('upload://finished', ({ payload }) => {
       isUploading.value = false
@@ -196,11 +331,13 @@ async function loadEvents() {
       selectedEventId.value = match ? match.id : (events.value[0]?.id ?? '')
     }
     await refreshFailedCount()
+    if (isPreviewWindow) await scanPreview()
+    else await notifyPreviewContext()
   } catch {}
 }
 
 async function refreshFailedCount() {
-  const eid = selectedEventId.value || savedEventId.value
+  const eid = currentEventId.value
   if (!eid) {
     failedCount.value = 0
     return
@@ -212,7 +349,232 @@ async function refreshFailedCount() {
 
 async function browseFolder() {
   const selected = await openDialog({ directory: true, multiple: false })
-  if (typeof selected === 'string') folder.value = selected
+  if (typeof selected === 'string') {
+    folder.value = selected
+    await saveConfig()
+    await notifyPreviewContext()
+  }
+}
+
+async function onEventChange() {
+  await refreshFailedCount()
+  if (isPreviewWindow) await scanPreview()
+  else {
+    await saveConfig()
+    await notifyPreviewContext()
+  }
+}
+
+async function scanPreview() {
+  if (!folder.value) {
+    previewPhotos.value = []
+    existingFeaturedIds.value = []
+    existingFeaturedLoading.value = false
+    captureTimesLoaded.value = false
+    captureTimesError.value = ''
+    previewPage.value = 1
+    previewPageInput.value = 1
+    return
+  }
+
+  const requestId = ++previewRequestId
+  existingFeaturedLoading.value = false
+  captureTimesLoaded.value = false
+  captureTimesError.value = ''
+  previewLoading.value = true
+  try {
+    const files = await invoke<PreviewFile[]>('cmd_preview_photos', { folder: folder.value })
+    if (requestId !== previewRequestId) return
+    existingFeaturedIds.value = []
+    featuredTouchedPaths.clear()
+    previewPage.value = 1
+    previewPageInput.value = 1
+    previewPhotos.value = files.map(file => ({
+      ...file,
+      previewUrl: convertFileSrc(file.abs_path),
+      photoId: null,
+      status: 'pending',
+      isFeatured: false,
+      featuredSync: 'idle',
+      thumbnailError: false,
+      message: '',
+    }))
+    if (captureTimeFilterActive.value) void loadCaptureTimes()
+  } catch (e) {
+    previewPhotos.value = []
+    addLog(`相片預覽掃描失敗：${e}`, 'error')
+    return
+  } finally {
+    if (requestId === previewRequestId) previewLoading.value = false
+  }
+
+  const eventId = currentEventId.value
+  if (requestId !== previewRequestId || !eventId || !token.value) return
+
+  existingFeaturedLoading.value = true
+  try {
+    const featuredIds = await invoke<string[]>('cmd_list_featured_photo_ids', {
+      token: token.value,
+      eventId,
+    }).catch(() => [])
+    if (requestId === previewRequestId) existingFeaturedIds.value = featuredIds
+  } finally {
+    if (requestId === previewRequestId) existingFeaturedLoading.value = false
+  }
+}
+
+async function loadCaptureTimes() {
+  if (!captureTimeFilterActive.value || captureTimesLoaded.value || captureTimesLoading.value || previewPhotos.value.length === 0) return
+
+  captureTimesLoading.value = true
+  captureTimesError.value = ''
+  try {
+    const captureTimes = await invoke<Record<string, number | null>>('cmd_preview_capture_times', {
+      paths: previewPhotos.value.map(photo => photo.abs_path),
+    })
+    for (const photo of previewPhotos.value) {
+        photo.capture_time_minutes = captureTimes[photo.abs_path] ?? null
+    }
+    captureTimesLoaded.value = true
+  } catch (e) {
+    captureTimesError.value = '拍攝時間讀取失敗，請重新嘗試。'
+    addLog(`拍攝時間讀取失敗：${e}`, 'error')
+  } finally {
+    captureTimesLoading.value = false
+  }
+}
+
+function updateFeaturedId(photoId: string, isFeatured: boolean) {
+  const ids = new Set(existingFeaturedIds.value)
+  if (isFeatured) ids.add(photoId)
+  else ids.delete(photoId)
+  existingFeaturedIds.value = [...ids]
+}
+
+function toggleFeatured(photo: PreviewPhoto) {
+  if (!currentEventId.value) {
+    alert('請先選擇活動')
+    return
+  }
+  if (!isOrganizationTarget.value && existingFeaturedLoading.value) {
+    alert('正在讀取目前精選狀態，請稍候再選擇')
+    return
+  }
+
+  const nextValue = !photo.isFeatured
+  if (nextValue && featuredLimit.value !== null && featuredCount.value >= featuredLimit.value) {
+    alert(`每個活動最多只能精選 ${featuredLimit.value} 張照片`)
+    return
+  }
+
+  photo.isFeatured = nextValue
+  photo.featuredSync = 'idle'
+  featuredTouchedPaths.add(photo.abs_path)
+  if (photo.photoId) {
+    updateFeaturedId(photo.photoId, nextValue)
+    queueFeaturedSync(photo)
+  }
+}
+
+function queueFeaturedSync(photo: PreviewPhoto) {
+  if (!photo.photoId || !currentEventId.value || !token.value) return
+
+  const path = photo.abs_path
+  const photoId = photo.photoId
+  const desiredValue = photo.isFeatured
+  const previous = featureSyncQueues.get(path) ?? Promise.resolve()
+  const next = previous
+    .catch(() => {})
+    .then(async () => {
+      if (photo.photoId !== photoId || photo.isFeatured !== desiredValue) return
+      photo.featuredSync = 'syncing'
+      await invoke('cmd_set_photo_featured', {
+        token: token.value,
+        eventId: currentEventId.value,
+        photoId,
+        isFeatured: desiredValue,
+        timeoutSecs: Math.min(Math.max(timeout.value, 10), 30),
+      })
+      if (photo.isFeatured === desiredValue) photo.featuredSync = 'synced'
+    })
+    .catch((e: unknown) => {
+      if (photo.isFeatured === desiredValue) {
+        photo.featuredSync = 'error'
+        addLog(`精選同步失敗：${photo.file_name} - ${e}`, 'error')
+      }
+    })
+
+  featureSyncQueues.set(path, next)
+}
+
+function handleUploadResult(payload: UploadResultEvent) {
+  const photo = previewPhotos.value.find(item => item.abs_path === payload.abs_path)
+  if (!photo) return
+
+  photo.status = payload.success
+    ? (payload.duplicate ? 'duplicate' : 'success')
+    : 'failed'
+  photo.message = payload.message
+  if (payload.photo_id) {
+    photo.photoId = payload.photo_id
+
+    const wasTouched = featuredTouchedPaths.has(photo.abs_path)
+    if (!wasTouched && existingFeaturedIds.value.includes(payload.photo_id)) {
+      photo.isFeatured = true
+    }
+    updateFeaturedId(payload.photo_id, photo.isFeatured)
+    if (photo.isFeatured || wasTouched) queueFeaturedSync(photo)
+  }
+}
+
+function onPreviewImageError(photo: PreviewPhoto) {
+  photo.thumbnailError = true
+}
+
+function previewStatusLabel(photo: PreviewPhoto) {
+  if (photo.featuredSync === 'syncing') return '精選同步中'
+  if (photo.featuredSync === 'error') return '精選同步失敗'
+  if (photo.status === 'uploading') return '上傳中'
+  if (photo.status === 'success') return '已上傳'
+  if (photo.status === 'duplicate') return '已存在'
+  if (photo.status === 'failed') return '上傳失敗'
+  return '待上傳'
+}
+
+function formatFileSize(bytes: number) {
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+function parseTimeInputMinutes(value: string) {
+  if (!value) return null
+  const [hours, minutes] = value.split(':').map(Number)
+  if (!Number.isInteger(hours) || !Number.isInteger(minutes)) return null
+  return hours * 60 + minutes
+}
+
+function jumpPreviewPage() {
+  const target = Number.isFinite(Number(previewPageInput.value))
+    ? Math.floor(Number(previewPageInput.value))
+    : 1
+  previewPage.value = Math.min(previewPageCount.value, Math.max(1, target))
+  previewPageInput.value = previewPage.value
+}
+
+function previousPreviewPage() {
+  previewPageInput.value = previewPage.value - 1
+  jumpPreviewPage()
+}
+
+function nextPreviewPage() {
+  previewPageInput.value = previewPage.value + 1
+  jumpPreviewPage()
+}
+
+function clearCaptureFilter() {
+  captureTimeFilter.value = 'all'
+  captureTimeFrom.value = ''
+  captureTimeTo.value = ''
 }
 
 async function browseGpx() {
@@ -322,21 +684,21 @@ function addLog(message: string, level = 'info') {
 function validateInputs(): boolean {
   if (!token.value) { alert('請先登入'); return false }
   if (!folder.value) { alert('請選擇相片資料夾'); return false }
-  if (!selectedEventId.value && !savedEventId.value) { alert('請選擇活動'); return false }
+  if (!currentEventId.value) { alert('請選擇活動'); return false }
   if (!location.value.trim()) { alert('請輸入拍攝地點'); return false }
   return true
 }
 
 function validateRetryInputs(): boolean {
   if (!token.value) { alert('請先登入'); return false }
-  if (!selectedEventId.value && !savedEventId.value) { alert('請選擇活動'); return false }
+  if (!currentEventId.value) { alert('請選擇活動'); return false }
   return true
 }
 
 function buildUploadParams() {
   return {
     token: token.value,
-    event_id: selectedEventId.value || savedEventId.value,
+    event_id: currentEventId.value,
     location: location.value,
     folder: folder.value,
     longitude: longitude.value || null,
@@ -390,7 +752,7 @@ async function stopUpload() {
 }
 
 async function clearLog() {
-  const eid = selectedEventId.value || savedEventId.value
+  const eid = currentEventId.value
   if (!eid || !confirm(`確定清除活動 ${eid} 的上傳紀錄？`)) return
   try {
     await invoke('cmd_clear_history', { eventId: eid })
@@ -418,11 +780,103 @@ function eventLabel(ev: EventInfo) { return `${ev.id} (${ev.name} - ${ev.date})`
       <span class="header-divider"></span>
       <span class="header-tagline">PHOTO UPLOADER</span>
       <div style="flex:1"></div>
-      <span :class="['status', `status--${loginStatus}`]">{{ loginLabel }}</span>
-      <button class="btn btn--primary btn--sm" @click="doLogin" :disabled="isUploading">網頁登入</button>
+      <template v-if="isPreviewWindow">
+        <span class="header-preview-label">PHOTO PREVIEW · 相片精選</span>
+      </template>
+      <template v-else>
+        <span :class="['status', `status--${loginStatus}`]">{{ loginLabel }}</span>
+        <button class="btn btn--primary btn--sm" @click="doLogin" :disabled="isUploading">網頁登入</button>
+      </template>
     </header>
 
-    <main class="main">
+    <main v-if="isPreviewWindow" class="main preview-main">
+      <section class="card photo-preview-card photo-preview-window-card">
+        <div class="photo-preview-header">
+          <div>
+            <h2 class="section-title photo-preview-title">PHOTO PREVIEW · 本次相片</h2>
+            <div class="photo-preview-summary">
+              {{ filteredPreviewPhotos.length }} / {{ previewPhotos.length }} 張 · 已選精選 {{ featuredCount }}<span v-if="featuredLimit !== null"> / {{ featuredLimit }}</span>
+              <span v-if="isOrganizationTarget"> · 主辦相簿</span>
+              <span v-else> · 攝影師活動</span>
+            </div>
+          </div>
+          <button class="btn btn--outline btn--sm" @click="scanPreview" :disabled="previewLoading">
+            {{ previewLoading ? '掃描中…' : '重新掃描' }}
+          </button>
+        </div>
+        <div class="photo-filter-row">
+          <span class="sublabel">拍攝時間</span>
+          <select class="input" v-model="captureTimeFilter">
+            <option value="all">全部相片</option>
+            <option value="with-time">有拍攝時間</option>
+            <option value="without-time">沒有拍攝時間</option>
+          </select>
+          <input class="input" type="time" v-model="captureTimeFrom" :disabled="captureTimeFilter === 'without-time'" />
+          <span class="sublabel">至</span>
+          <input class="input" type="time" v-model="captureTimeTo" :disabled="captureTimeFilter === 'without-time'" />
+          <button
+            v-if="captureTimeFilter !== 'all' || captureTimeFrom || captureTimeTo"
+            class="btn btn--clear"
+            @click="clearCaptureFilter"
+          >清除篩選</button>
+        </div>
+        <div v-if="isUploading" class="photo-preview-note">上傳進行中，可繼續選取精選照</div>
+
+        <div v-if="previewLoading" class="photo-preview-empty">正在讀取相片清單…</div>
+        <div v-else-if="captureTimesLoading" class="photo-preview-empty">正在讀取 EXIF 拍攝時間…</div>
+        <div v-else-if="captureTimesError" class="photo-preview-empty">{{ captureTimesError }}</div>
+        <div v-else-if="previewPhotos.length === 0" class="photo-preview-empty">此資料夾沒有支援的 JPG、JPEG 或 PNG 相片。</div>
+        <div v-else-if="filteredPreviewPhotos.length === 0" class="photo-preview-empty">目前的拍攝時間篩選沒有相片。</div>
+        <template v-else>
+          <div class="photo-grid">
+            <article v-for="photo in visiblePreviewPhotos" :key="photo.abs_path" class="photo-tile">
+              <div class="photo-thumb">
+                <img
+                  v-if="!photo.thumbnailError"
+                  :src="photo.previewUrl"
+                  :alt="photo.file_name"
+                  loading="lazy"
+                  decoding="async"
+                  @error="onPreviewImageError(photo)"
+                />
+                <div v-else class="photo-thumb-error">無法讀取</div>
+                <button
+                  class="photo-feature-button"
+                  :class="{ 'photo-feature-button--active': photo.isFeatured }"
+                  :disabled="!currentEventId"
+                  :title="photo.isFeatured ? '取消精選' : '加入精選'"
+                  @click.stop="toggleFeatured(photo)"
+                >
+                  ★
+                </button>
+                <span :class="['photo-status', `photo-status--${photo.status}`]">{{ previewStatusLabel(photo) }}</span>
+              </div>
+              <div class="photo-name" :title="photo.file_name">{{ photo.file_name }}</div>
+              <div class="photo-size">{{ formatFileSize(photo.file_size) }}</div>
+            </article>
+          </div>
+          <div class="photo-preview-footer">
+            <span>第 {{ previewPage }} / {{ previewPageCount }} 頁</span>
+            <div class="row gap8">
+              <button class="btn btn--outline btn--sm" @click="previousPreviewPage" :disabled="previewPage <= 1">上一頁</button>
+              <input
+                class="input page-input"
+                type="number"
+                min="1"
+                :max="previewPageCount"
+                v-model.number="previewPageInput"
+                @keyup.enter="jumpPreviewPage"
+                aria-label="指定預覽分頁"
+              />
+              <button class="btn btn--outline btn--sm" @click="jumpPreviewPage">跳轉</button>
+              <button class="btn btn--outline btn--sm" @click="nextPreviewPage" :disabled="previewPage >= previewPageCount">下一頁</button>
+            </div>
+          </div>
+        </template>
+      </section>
+    </main>
+
+    <main v-else class="main">
 
       <!-- 上傳參數 -->
       <section class="card">
@@ -433,13 +887,14 @@ function eventLabel(ev: EventInfo) { return `${ev.id} (${ev.name} - ${ev.date})`
           <div class="row">
             <input class="input flex1" :value="folder" readonly placeholder="點擊瀏覽選擇資料夾" />
             <button class="btn btn--outline" @click="browseFolder" :disabled="isUploading">瀏覽</button>
+            <button class="btn btn--gold" @click="openPreviewWindow" :disabled="!folder">預覽與設定精選</button>
           </div>
         </div>
 
         <div class="field">
           <label class="field-label">活動選擇</label>
           <div class="row">
-            <select class="input flex1" v-model="selectedEventId" :disabled="isUploading" @change="refreshFailedCount">
+            <select class="input flex1" v-model="selectedEventId" :disabled="isUploading" @change="onEventChange">
               <option value="">— 請登入後更新活動列表 —</option>
               <option v-for="ev in events" :key="ev.id" :value="ev.id">{{ eventLabel(ev) }}</option>
             </select>
@@ -594,6 +1049,12 @@ body {
   letter-spacing: 0.2em;
   color: var(--n40);
 }
+.header-preview-label {
+  color: var(--white);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
 
 .main {
   padding: 10px 12px 12px;
@@ -604,6 +1065,7 @@ body {
   overflow-y: auto;
   flex: 1;
 }
+.preview-main { padding: 14px; }
 
 /* ── 卡片 ── */
 .card {
@@ -790,6 +1252,114 @@ select.input {
 .log-error   { color: #eb5757; }
 .log-warn    { color: var(--gold); }
 
+/* ── 相片預覽 ── */
+.photo-preview-card { padding-bottom: 10px; }
+.photo-preview-window-card { min-height: 100%; }
+.photo-preview-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.photo-preview-title { margin-bottom: 2px; border-bottom: 0; padding-bottom: 0; }
+.photo-preview-summary { color: var(--n60); font-size: 12px; }
+.photo-filter-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--n20);
+}
+.photo-filter-row .input { width: auto; min-width: 132px; }
+.page-input { width: 58px !important; min-width: 58px !important; padding-left: 6px; padding-right: 6px; text-align: center; }
+.photo-preview-empty {
+  color: var(--n60);
+  text-align: center;
+  padding: 22px 8px 12px;
+}
+.photo-preview-note {
+  margin-top: 10px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: #fdf6e3;
+  color: var(--gold-dark);
+  font-size: 12px;
+}
+.photo-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+.photo-tile { min-width: 0; }
+.photo-thumb {
+  aspect-ratio: 3 / 2;
+  background: var(--black);
+  border: 1px solid var(--n20);
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+}
+.photo-thumb img { width: 100%; height: 100%; display: block; object-fit: contain; }
+.photo-thumb-error {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--n40);
+  font-size: 11px;
+}
+.photo-feature-button {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  width: 25px;
+  height: 25px;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(33,33,33,.7);
+  color: var(--white);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+.photo-feature-button:hover:not(:disabled) { background: var(--gold-dark); }
+.photo-feature-button--active { background: var(--gold); color: var(--white); }
+.photo-feature-button:disabled { opacity: .45; cursor: not-allowed; }
+.photo-status {
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  padding: 2px 4px;
+  border-radius: 2px;
+  background: rgba(33,33,33,.75);
+  color: var(--white);
+  font-size: 10px;
+  line-height: 1.2;
+}
+.photo-status--success { background: rgba(39,120,72,.85); }
+.photo-status--duplicate { background: rgba(140,98,40,.9); }
+.photo-status--failed { background: rgba(179,38,42,.9); }
+.photo-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--n90);
+  font-size: 11px;
+  margin-top: 4px;
+}
+.photo-size { color: var(--n40); font-size: 10px; }
+.photo-preview-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--n60);
+  font-size: 11px;
+  margin-top: 10px;
+}
+
 /* ── 進度 ── */
 .progress-card { padding: 10px 16px; }
 .progress-bar-wrap {
@@ -816,6 +1386,14 @@ select.input {
 /* ── 操作按鈕列 ── */
 .btn-row { display: flex; gap: 10px; margin-top: 10px; }
 .btn-row .btn { flex: 1; min-width: 0; }
+
+@media (max-width: 1050px) {
+  .photo-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+}
+
+@media (max-width: 760px) {
+  .photo-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
 
 /* ── 進階設定 ── */
 .advanced { margin-top: 8px; }

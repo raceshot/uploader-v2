@@ -18,6 +18,33 @@ pub fn host_upload_url() -> String {
     format!("{}/api/v1/host/albums/upload/photo", API_BASE)
 }
 
+pub fn photographer_featured_url(photo_id: &str) -> String {
+    format!(
+        "{}/api/v1/photographer/photos/{}/featured",
+        API_BASE,
+        urlencoding::encode(photo_id)
+    )
+}
+
+pub fn host_photo_url(event_id: &str, photo_id: &str) -> String {
+    format!(
+        "{}/api/v1/host/albums/{}/photos/{}",
+        API_BASE,
+        urlencoding::encode(strip_org_prefix(event_id).as_str()),
+        urlencoding::encode(photo_id)
+    )
+}
+
+pub fn host_photos_url(event_id: &str, page: usize, limit: usize) -> String {
+    format!(
+        "{}/api/v1/host/albums/{}/photos?page={}&limit={}&featured_only=true",
+        API_BASE,
+        urlencoding::encode(strip_org_prefix(event_id).as_str()),
+        page,
+        limit
+    )
+}
+
 pub fn verify_token_url() -> String {
     format!("{}/api/v1/photographer/api/verify", API_BASE)
 }
@@ -127,6 +154,130 @@ pub async fn list_events(client: &Client, token: &str) -> Result<Vec<EventInfo>>
 
     let payload: EventsResponse = resp.json().await?;
     Ok(payload.events.unwrap_or_default())
+}
+
+pub async fn list_featured_photo_ids(
+    client: &Client,
+    token: &str,
+    event_id: &str,
+    timeout_secs: u64,
+) -> Result<Vec<String>> {
+    let timeout = std::time::Duration::from_secs(timeout_secs.max(10));
+
+    if event_id.starts_with("org_") {
+        let mut page = 1usize;
+        let limit = 100usize;
+        let mut photo_ids = Vec::new();
+
+        loop {
+            let resp = client
+                .get(host_photos_url(event_id, page, limit))
+                .bearer_auth(token)
+                .timeout(timeout)
+                .send()
+                .await?;
+            let status = resp.status();
+            let payload: serde_json::Value = resp.json().await?;
+
+            if !status.is_success() {
+                return Err(AppError::Other(api_error_message(&payload, "取得主辦相簿精選失敗")));
+            }
+
+            let rows = payload
+                .get("photos")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let row_count = rows.len();
+            photo_ids.extend(rows.into_iter().filter_map(|photo| {
+                photo
+                    .get("photo_id")
+                    .and_then(|value| value.as_str())
+                    .map(String::from)
+            }));
+
+            let total = payload
+                .get("total")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(photo_ids.len() as u64);
+            if row_count == 0 || photo_ids.len() as u64 >= total {
+                break;
+            }
+            page += 1;
+        }
+
+        return Ok(photo_ids);
+    }
+
+    let resp = client
+        .get(format!(
+            "{}/api/v1/photographer/photos/featured?event_id={}",
+            API_BASE,
+            urlencoding::encode(event_id)
+        ))
+        .bearer_auth(token)
+        .timeout(timeout)
+        .send()
+        .await?;
+    let status = resp.status();
+    let payload: serde_json::Value = resp.json().await?;
+
+    if !status.is_success() {
+        return Err(AppError::Other(api_error_message(&payload, "取得攝影師精選失敗")));
+    }
+
+    Ok(payload
+        .get("photos")
+        .and_then(|value| value.as_array())
+        .map(|photos| {
+            photos
+                .iter()
+                .filter_map(|photo| {
+                    photo
+                        .get("photo_id")
+                        .and_then(|value| value.as_str())
+                        .map(String::from)
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+pub async fn set_photo_featured(
+    client: &Client,
+    token: &str,
+    event_id: &str,
+    photo_id: &str,
+    is_featured: bool,
+    timeout_secs: u64,
+) -> Result<()> {
+    let (url, body) = if event_id.starts_with("org_") {
+        (
+            host_photo_url(event_id, photo_id),
+            serde_json::json!({ "is_featured": is_featured }),
+        )
+    } else {
+        (
+            photographer_featured_url(photo_id),
+            serde_json::json!({ "event_id": event_id, "is_featured": is_featured }),
+        )
+    };
+
+    let resp = client
+        .put(url)
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(timeout_secs.max(10)))
+        .json(&body)
+        .send()
+        .await?;
+    let status = resp.status();
+    let payload: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+
+    if !status.is_success() {
+        return Err(AppError::Other(api_error_message(&payload, "更新精選狀態失敗")));
+    }
+
+    Ok(())
 }
 
 /// 上傳單張圖片，含重試邏輯
@@ -274,6 +425,7 @@ fn parse_upload_response(
         .and_then(|arr| arr.first())
         .and_then(|v| v.as_str())
         .or_else(|| payload.get("photo_id").and_then(|v| v.as_str()))
+        .or_else(|| payload.get("photoId").and_then(|v| v.as_str()))
         .map(String::from);
 
     if success {
@@ -329,10 +481,44 @@ fn infer_mime(file_name: &str) -> &'static str {
     }
 }
 
+fn api_error_message(payload: &serde_json::Value, fallback: &str) -> String {
+    payload
+        .get("error")
+        .or_else(|| payload.get("message"))
+        .or_else(|| payload.get("details"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
 pub fn choose_endpoint(event_id: &str) -> String {
     if event_id.starts_with("org_") {
         host_upload_url()
     } else {
         photographer_upload_url()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{choose_endpoint, parse_upload_response, photographer_upload_url};
+
+    #[test]
+    fn upload_response_accepts_photographer_camel_case_photo_id() {
+        let result = parse_upload_response(
+            &serde_json::json!({ "success": true, "photoId": "photo-1" }),
+            "photo.jpg",
+            "/photos/photo.jpg",
+            200,
+        )
+        .expect("成功回應應該可解析");
+
+        assert_eq!(result.photo_id.as_deref(), Some("photo-1"));
+    }
+
+    #[test]
+    fn organization_event_uses_host_upload_endpoint() {
+        assert_ne!(choose_endpoint("org_123"), photographer_upload_url());
+        assert!(choose_endpoint("org_123").ends_with("/api/v1/host/albums/upload/photo"));
     }
 }
